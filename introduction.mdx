@@ -1,0 +1,67 @@
+---
+title: "Polymarket Copy Trading Bot: Automated Arb & Copy Trading"
+description: "Polymarket Copy Trading Bot is a production Node.js runtime for BTC Up/Down arbitrage and wallet copy trading on Polygon with full risk controls."
+---
+
+The Polymarket Copy Trading Bot is a production-grade Node.js runtime for trading on Polymarket's prediction markets on the Polygon network. It ships two fully operational strategies — a BTC Up/Down arbitrage engine and a dedicated buy-only copy trading system — along with on-chain approval flows, WebSocket order-book tracking, structured logging, and configurable risk controls. This page introduces the project, its structure, and its key capabilities.
+
+## What the bot does
+
+The repository supports two primary trading workflows.
+
+**Arbitrage mode** targets the recurring `btc-updown-5m` markets on Polymarket. The bot discovers the next 5-minute BTC Up/Down market before it opens, posts a symmetric buy ladder across both the `Up` and `Down` outcomes, fires taker orders when the combined best ask falls below a configured edge threshold, merges matched complementary-token pairs back into USDC, cancels open orders at market close, and redeems winning positions after oracle resolution.
+
+**Copy trading mode** follows one or more target Polymarket wallets and mirrors their buy activity with configurable sizing, slippage limits, price filters, and spend caps. The repository contains two copy-trading paths: an integrated copy watcher (`src/copy-trader.js`) that runs alongside the main arbitrage runtime, and a dedicated buy-only copy trader (`src/copy/`) that polls the public trade feed independently and can be launched as a standalone process.
+
+## Project structure
+
+The source code lives under `src/` and is organized around clear responsibilities:
+
+```text
+.
+├── .env.example
+├── package.json
+└── src/
+    ├── index.js          # Main bot lifecycle, startup, market loop, graceful shutdown
+    ├── trader.js         # Per-market state machine: ladder, taker arb, merge, redeem
+    ├── copy-trader.js    # Integrated target-wallet mirroring
+    ├── market.js         # Gamma/Data API helpers for market discovery and resolution
+    ├── clob.js           # CLOB REST and WebSocket client, auth, and order utilities
+    ├── onchain.js        # Polygon approvals, balances, merge, and redeem transactions
+    ├── pnl.js            # P&L tracking utilities
+    ├── logger.js         # Winston-based structured console and file logging
+    └── copy/
+        ├── index.js      # Dedicated copy-trading entrypoint
+        ├── activityFeed.js  # High-frequency polling of public trade data
+        ├── copyTrader.js    # Copy execution engine with filters and spend accounting
+        └── config.js     # Copy-trading configuration
+```
+
+`src/index.js` is the main entrypoint for the arbitrage bot and the integrated copy watcher. `src/trader.js` implements the full per-market lifecycle as a state machine. The `src/copy/` directory is the self-contained copy trading engine you can run independently via `node src/copy/index.js`.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Dual-sided ladder execution" icon="chart-bar">
+    Posts buy orders across configurable price levels on both Up and Down outcomes at market open, providing resting liquidity for the full trading window.
+  </Card>
+  <Card title="Taker arbitrage logic" icon="bolt">
+    Monitors the live order book via WebSocket and fires paired taker buys whenever the combined best ask drops below the configured edge threshold.
+  </Card>
+  <Card title="On-chain merge and redeem" icon="link">
+    Automatically merges matched complementary-token pairs back into USDC when the threshold is met, and redeems winning positions after oracle resolution.
+  </Card>
+  <Card title="Session and per-market risk controls" icon="shield">
+    Enforces spend caps, inventory imbalance guardrails, a combined-ask circuit breaker, and a rolling hourly loss limit to bound downside on every run.
+  </Card>
+  <Card title="Dedicated copy-trading engine" icon="copy">
+    Polls public trade data for one or more target wallets and submits capped buy orders with configurable sizing modes (FIXED, MIRROR, RATIO), price filters, slippage limits, and stale-signal rejection.
+  </Card>
+  <Card title="Structured logging and graceful shutdown" icon="file-text">
+    Writes colored structured logs to the console and JSON logs to `bot.log` via Winston. Handles `SIGINT` and `SIGTERM` cleanly, cancelling open orders before exit.
+  </Card>
+</CardGroup>
+
+<Warning>
+  This software places live blockchain and market orders on Polygon. It is intended for users who fully understand the strategy, the wallet setup, gas implications, and the financial risks involved. It is not financial advice and does not guarantee profit. You are fully responsible for how you configure and operate it.
+</Warning>

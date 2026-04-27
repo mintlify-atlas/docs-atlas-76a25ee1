@@ -1,0 +1,99 @@
+---
+title: "Arbitrage bot settings and risk parameters"
+description: "Full reference for all arbitrage environment variables in Polymarket Copy Trading Bot, including ladder, edge, spend caps, and circuit breakers."
+---
+
+The arbitrage strategy uses a passive maker ladder combined with opportunistic taker fills to capture the spread between the Up and Down legs of each BTC 5-minute market. The parameters below control how aggressively the bot trades, how much capital it risks, and when it stops to protect against adverse conditions. Review every value before going live — the defaults are conservative but may not match your account size.
+
+<Note>
+  These limits are safety-critical, not optional tuning knobs. Removing or
+  substantially raising them without understanding the risk model can result in
+  outsized losses within a single market window.
+</Note>
+
+## Spend and inventory caps
+
+<ParamField path="MAX_SPEND_PER_MARKET" type="number" default="400">
+  Maximum USDC the bot will spend (buy-side) across both legs within a single
+  5-minute market window. Once this threshold is reached the bot stops placing
+  new taker orders for the current window but continues managing existing
+  positions.
+</ParamField>
+
+<ParamField path="MAX_TAKER_FILL_USDC" type="number" default="100">
+  Maximum size of a single taker fill, in USDC. Limits per-order slippage and
+  prevents an oversized sweep of the book on a thin market.
+</ParamField>
+
+<ParamField path="MAX_INVENTORY_IMBALANCE_USDC" type="number" default="200">
+  Stop buying the over-held side when the absolute difference between Up shares
+  and Down shares (in USDC equivalent) exceeds this value. Prevents the
+  portfolio from becoming directionally exposed when one side fills faster than
+  the other.
+</ParamField>
+
+## Edge and merge thresholds
+
+<ParamField path="TARGET_EDGE" type="number" default="0.02">
+  Minimum net arbitrage edge required before the bot fires a taker buy (Rule 3
+  of the strategy). A value of `0.02` means at least 2 cents of net profit per
+  complementary pair after estimated gas. Raising this reduces trade frequency
+  but improves fill quality.
+</ParamField>
+
+<ParamField path="MERGE_THRESHOLD_USDC" type="number" default="15">
+  Minimum matched pairs (in USDC equivalent) before calling `mergePositions` to
+  redeem complementary tokens for USDC (Rule 4). Keep this value at or above
+  `10` to ensure the gas cost of the merge transaction is well covered by the
+  redeemed amount.
+</ParamField>
+
+## Circuit breakers
+
+<ParamField path="COMBINED_ASK_STOP" type="number" default="1.02">
+  Pull all resting maker orders when the sum of the best ask on the Up leg and
+  the best ask on the Down leg exceeds this value. A combined ask above `1.00`
+  means no risk-free arbitrage exists; the `1.02` default adds a small buffer
+  for fee costs before triggering the pull.
+</ParamField>
+
+<ParamField path="MAX_LOSS_PER_HOUR_USDC" type="number" default="300">
+  Maximum cumulative realized loss per rolling hour before the bot halts and
+  waits for operator intervention. Losses are tracked across all markets within
+  the hour window. Once this limit is hit the process exits with a non-zero
+  status code.
+</ParamField>
+
+## Ladder parameters
+
+The maker ladder places passive limit orders at a set of price levels on both the Up and Down sides simultaneously, providing liquidity across the full probability range of each market.
+
+<ParamField path="LADDER_LEVELS" type="string" default="0.02,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.48,0.50,0.52,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95,0.98">
+  Comma-separated list of round-cent price levels at which maker orders are
+  posted for both the Up and Down sides. The default set contains 23 levels
+  spanning the full 0.02–0.98 range. Adjust this list to concentrate liquidity
+  at specific price points or to reduce the number of open orders.
+</ParamField>
+
+<ParamField path="LADDER_SIZE_PER_LEVEL_USDC" type="number" default="20">
+  USDC allocated per ladder level per side. With the default 23 levels and
+  `20` USDC each, the maximum resting exposure per market is
+  `23 × 20 × 2 = 920 USDC` before `MAX_SPEND_PER_MARKET` clamps the total.
+</ParamField>
+
+## Hardcoded timing constants
+
+Two timing values are fixed in source and cannot be changed via environment variables. They are documented here for transparency.
+
+| Constant | Value | Description |
+|---|---|---|
+| `STOP_BUYING_BEFORE_CLOSE` | 15 seconds | The bot stops placing new taker orders this many seconds before a market window closes, avoiding fills that cannot be paired before resolution. |
+| `BOOK_POLL_MS` | 1 500 ms | Fallback REST polling interval for order book data when the WebSocket feed is unavailable. |
+
+<Tip>
+  For your first live run, consider halving the defaults: set
+  `MAX_SPEND_PER_MARKET=200`, `MAX_TAKER_FILL_USDC=50`,
+  `MAX_LOSS_PER_HOUR_USDC=50`, and `LADDER_SIZE_PER_LEVEL_USDC=5`. This keeps
+  total exposure low while you verify that order signing, fills, and merges are
+  all working correctly on your account.
+</Tip>

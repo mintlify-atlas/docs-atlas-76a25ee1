@@ -1,0 +1,195 @@
+---
+title: "On-chain module: approvals, merge, and redeem"
+description: "Reference for src/onchain.js — Polygon approvals, token balance queries, mergePositions, redeemPositions, and the NegRiskAdapter contract interface."
+---
+
+`src/onchain.js` handles every direct Polygon blockchain interaction the bot makes. It uses ethers v6 and a singleton `JsonRpcProvider` / `Wallet` pair so no duplicate connections are created at runtime. The module covers four concerns: one-time ERC-20 and ERC-1155 approvals needed before any orders can be posted or merged, USDC and conditional-token balance queries, `mergePositions` to burn matched YES+NO pairs back into USDC, and `redeemPositions` to claim the winning payout after the oracle resolves.
+
+## Contract addresses
+
+All addresses are for the Polygon mainnet (chain ID 137) and are exported from `src/config.js`.
+
+| Contract | Address | Notes |
+|---|---|---|
+| USDC | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` | USDC.e bridged token, 6 decimals |
+| ConditionalTokens (CTF) | `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` | ERC-1155 prediction market tokens |
+| NegRiskAdapter | `0xD91e80cf2C1f8038c75b4f93Fd9c28C4aa01B6F8` | Wraps CTF for multi-outcome (NegRisk) markets |
+| NegRiskCTFExchange | `0xC5d563A36AE78145C45a50134d48A1215220f80a` | Exchange contract for NegRisk markets |
+| CTFExchange | `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E` | Exchange contract for standard binary markets |
+
+## Provider and signer
+
+`getProvider()` and `getSigner()` both return singletons. They are created on first call and reused for every subsequent operation.
+
+```javascript src/onchain.js
+let _provider = null;
+let _wallet   = null;
+
+export function getProvider() {
+  if (!_provider) {
+    _provider = new ethers.JsonRpcProvider(POLYGON_RPC);
+  }
+  return _provider;
+}
+
+export function getSigner() {
+  if (!_wallet) {
+    _wallet = new ethers.Wallet(PRIVATE_KEY, getProvider());
+  }
+  return _wallet;
+}
+```
+
+## Functions
+
+### `ensureApprovals()`
+
+A one-time startup call that sets the two permissions the bot requires to operate:
+
+1. **USDC approval for NegRiskCTFExchange** — allows the exchange to debit USDC from the wallet when a buy order fills on-chain.
+2. **CTF `setApprovalForAll` for NegRiskAdapter** — authorises the adapter to burn ERC-1155 conditional tokens during `mergePositions`.
+
+Both approvals are checked before they are submitted, so re-running `ensureApprovals()` is safe and costs no gas if the approvals are already in place.
+
+<Note>
+  Call `ensureApprovals()` exactly once during bot startup, before posting any orders or calling `mergePositions`. The main entrypoint in `src/index.js` already does this automatically.
+</Note>
+
+```javascript src/onchain.js
+export async function ensureApprovals() {
+  const signer = getSigner();
+  const addr   = await signer.getAddress();
+
+  // 1. USDC approval for NEG_RISK_CTF_EXCHANGE
+  const usdcContract = usdc();
+  const allowance    = await usdcContract.allowance(addr, NEG_RISK_CTF_EXCHANGE);
+  const maxUint256   = ethers.MaxUint256;
+  if (allowance < maxUint256 / 2n) {
+    const tx = await usdcContract.approve(NEG_RISK_CTF_EXCHANGE, maxUint256);
+    await tx.wait();
+  }
+
+  // 2. CTF setApprovalForAll for NEG_RISK_ADAPTER
+  const ctfContract = ctf();
+  const isApproved  = await ctfContract.isApprovedForAll(addr, NEG_RISK_ADAPTER_ADDRESS);
+  if (!isApproved) {
+    const tx = await ctfContract.setApprovalForAll(NEG_RISK_ADAPTER_ADDRESS, true);
+    await tx.wait();
+  }
+}
+```
+
+### `getUsdcBalance()`
+
+Returns the wallet's USDC.e balance in human units (e.g. `1000.50`). Internally calls `balanceOf` on the ERC-20 contract and divides the raw result by `USDC_SCALE` (`1_000_000`).
+
+```javascript
+const balance = await getUsdcBalance();
+// → 1000.5
+```
+
+### `getTokenBalance(tokenId)`
+
+Returns the ERC-1155 balance for a single conditional token ID. Result is in human units with 6 decimal precision.
+
+```javascript
+const shares = await getTokenBalance('123456789...');
+// → 50.0
+```
+
+### `getTokenBalances(tokenIds)`
+
+Batch-fetches balances for multiple token IDs in a single `balanceOfBatch` call. Returns a plain object keyed by token ID.
+
+```javascript
+const balances = await getTokenBalances([tokenIdA, tokenIdB]);
+// → { '123...': 50.0, '456...': 50.0 }
+```
+
+### `getPositionIds(conditionId)`
+
+Queries the NegRiskAdapter for the two ERC-1155 token IDs that correspond to outcome 0 (Up) and outcome 1 (Down) for a given condition.
+
+```javascript
+const [id0, id1] = await getPositionIds('0xabc...');
+```
+
+Internally calls `getPositionId(conditionId, 0)` and `getPositionId(conditionId, 1)` in parallel via `Promise.all`.
+
+### `mergePositions(conditionId, amountHuman)`
+
+Burns an equal number of outcome-0 and outcome-1 tokens and returns the equivalent USDC.e to the caller. This is how matched complementary pairs are collapsed back into collateral.
+
+`amountHuman` is expressed in human units (e.g. `50.5`). The function scales it to the 6-decimal integer expected by the contract.
+
+```javascript src/onchain.js
+export async function mergePositions(conditionId, amountHuman) {
+  const amount = BigInt(Math.floor(amountHuman * USDC_SCALE));
+  if (amount <= 0n) throw new Error('mergePositions: amount must be > 0');
+
+  const tx = await negRiskAdapter().mergePositions(conditionId, amount, {
+    gasLimit: 500_000,
+  });
+  const receipt = await tx.wait();
+  logger.info('Onchain: merge confirmed', {
+    conditionId,
+    amountHuman,
+    tx: tx.hash,
+    gasUsed: receipt.gasUsed.toString(),
+  });
+  return tx.hash;
+}
+```
+
+**Gas limit:** 500,000 units. Typical actual usage is lower, but the ceiling is set conservatively to avoid out-of-gas reverts on congested Polygon blocks.
+
+### `redeemPositions(conditionId)`
+
+Redeems winning tokens after the oracle resolves the market. Passing `indexSets: [1, 2]` instructs the NegRiskAdapter to attempt redemption of both outcome-0 and outcome-1 tokens. The contract only pays out the winning outcome; the call does not revert for losing tokens.
+
+```javascript src/onchain.js
+export async function redeemPositions(conditionId) {
+  // indexSets = [1, 2]: attempt to redeem outcome-0 AND outcome-1.
+  // The contract will only pay out for whichever actually won.
+  const tx = await negRiskAdapter().redeemPositions(conditionId, [1, 2], {
+    gasLimit: 300_000,
+  });
+  const receipt = await tx.wait();
+  logger.info('Onchain: redeem confirmed', {
+    conditionId,
+    tx: tx.hash,
+    gasUsed: receipt.gasUsed.toString(),
+  });
+  return tx.hash;
+}
+```
+
+**Gas limit:** 300,000 units.
+
+### `sleep(ms)`
+
+A simple `Promise`-based delay helper used to introduce pauses in polling loops.
+
+```javascript
+await sleep(2000); // wait 2 seconds
+```
+
+## The NegRiskAdapter pattern
+
+Polymarket's NegRisk markets represent each outcome as a complementary ERC-1155 token pair. Buying 10 YES tokens at $0.60 and 10 NO tokens at $0.40 costs $10.00 in USDC and results in a balanced position worth exactly $10.00 regardless of the outcome — a fact the `mergePositions` function exploits.
+
+When the bot holds a matched pair (equal quantities of both outcome tokens for the same condition), calling `mergePositions` burns both tokens and credits the equivalent USDC back to the wallet immediately, without waiting for oracle resolution.
+
+`redeemPositions` is the post-resolution path. After the oracle settles the market, only the winning token has value. Passing `indexSets: [1, 2]` covers both possible winners in one transaction — the adapter ignores the losing side and pays out the winner at $1.00 per share.
+
+**Why `indexSets = [1, 2]`?** The NegRiskAdapter uses a bitmask where index set `1` represents outcome-0 and index set `2` represents outcome-1. Passing both ensures the bot redeems correctly regardless of which side resolved as the winner.
+
+## Minimal ABIs
+
+The module declares three minimal ABIs covering only the functions it calls. This keeps the bundle small and avoids decoding unnecessary event data.
+
+| ABI | Functions used |
+|---|---|
+| `ERC20_ABI` | `approve`, `allowance`, `balanceOf`, `decimals` |
+| `CTF_ABI` | `setApprovalForAll`, `isApprovedForAll`, `balanceOf`, `balanceOfBatch` |
+| `NEG_RISK_ADAPTER_ABI` | `mergePositions`, `redeemPositions`, `getPositionId` |

@@ -1,0 +1,67 @@
+---
+title: "Requirements: Node.js, USDC, wallet, and Polygon RPC"
+description: "Hardware, software, and account prerequisites before running the Polymarket Copy Trading Bot, including Node.js version, wallet, USDC, and RPC setup."
+---
+
+Before you run the bot, confirm that you meet the software, account, and network prerequisites listed on this page. Missing any of these will cause the bot to exit immediately with an error or to fail silently on order submission.
+
+## Software requirements
+
+| Requirement | Version | Notes |
+|---|---|---|
+| Node.js | `>=18.0.0` | Required by the `engines` field in `package.json`. Versions below 18 are not supported. |
+| npm | Included with Node.js | Used to install dependencies and run the bot scripts. |
+
+The repository includes a `package-lock.json`. Run `npm install` after cloning to reproduce the exact dependency tree.
+
+## Account and wallet requirements
+
+### Polymarket account
+
+You need an active Polymarket account to trade. The account is tied to your Polygon EOA wallet. When you connect a browser wallet to Polymarket, the platform creates a **proxy wallet** — a separate smart contract address — on your behalf. The bot requires this proxy wallet address, not your browser wallet address.
+
+### Polygon EOA private key (`PRIVATE_KEY`)
+
+This is the private key for the Polygon wallet you connected to Polymarket. The bot uses it to sign on-chain transactions (approvals, merges, redeems) and to derive CLOB API credentials via Polymarket's L1-to-L2 auth flow.
+
+### Polymarket proxy wallet address (`PROXY_WALLET`)
+
+This is the smart contract wallet address that Polymarket created for your account. It is the address that holds your USDC, receives trade fills, and accumulates conditional tokens.
+
+<Note>
+  To find your proxy wallet address: log in to [polymarket.com](https://polymarket.com), open your profile, and copy the wallet address displayed there. It is distinct from the EOA address you connected — it typically starts with `0x` and is a different address from your MetaMask or browser wallet. You can also find it in the Polymarket interface under your account settings or by inspecting the address shown on your portfolio page.
+</Note>
+
+### USDC on Polygon (`USDC.e`)
+
+The bot trades using USDC.e (bridged USDC) on Polygon (`0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`). Your proxy wallet must hold sufficient USDC to cover your configured spend caps. For arbitrage, this means at least `MAX_SPEND_PER_MARKET` USDC available. For copy trading, budget for `COPY_MAX_USDC_TOTAL`.
+
+### MATIC for gas
+
+On-chain operations — including token approvals, merge transactions, and redeem transactions — require native MATIC to pay gas fees on Polygon. Keep a small MATIC balance in your EOA wallet (the signer, not the proxy wallet). A few dollars' worth is typically sufficient for extended operation.
+
+<Warning>
+  Use a dedicated wallet for bot operation. Do not use a wallet that holds funds you use for anything else. A misconfigured private key or an unexpected strategy behavior could expose all funds in that wallet. Create a fresh Polymarket account with a dedicated EOA for running the bot.
+</Warning>
+
+## Network requirements
+
+### Polygon RPC endpoint (`POLYGON_RPC`)
+
+The bot uses an `ethers` provider to send on-chain transactions. You configure the RPC endpoint via the `POLYGON_RPC` variable in `.env`.
+
+The default value in `.env.example` is the public endpoint:
+
+```text
+https://polygon-rpc.com
+```
+
+This endpoint works for initial setup and testing, but it is not reliable enough for production trading. Public RPC endpoints are rate-limited, shared across many users, and can return stale data or drop requests during high-traffic periods. A dropped RPC call during an approval or merge transaction can leave the bot in an inconsistent state.
+
+**Recommended providers for a private endpoint:**
+
+- [Alchemy](https://www.alchemy.com/) — free tier available, low latency
+- [Infura](https://infura.io/) — free tier available, reliable
+- [QuickNode](https://www.quicknode.com/) — paid, high performance
+
+Replace the `POLYGON_RPC` value in your `.env` with the HTTP endpoint URL from your chosen provider before running in production.

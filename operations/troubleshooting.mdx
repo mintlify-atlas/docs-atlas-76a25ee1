@@ -1,0 +1,131 @@
+---
+title: "Troubleshooting common bot issues"
+description: "Solutions for common Polymarket Copy Trading Bot problems: startup errors, auth failures, missing copy trades, failed merges, and RPC connectivity issues."
+---
+
+Most problems with the bot fall into a small number of categories: missing or incorrect environment variables, authentication mismatches, copy trade filters silently rejecting signals, on-chain transaction failures, and network instability. The sections below cover the most common failure modes with concrete diagnosis steps and resolution actions. When in doubt, check `bot.log` first — it captures the full error payload for every failure event.
+
+<AccordionGroup>
+  <Accordion title="Bot exits immediately with a missing env var error">
+    **Symptom:** The process exits within a second of starting with a message like `Missing required env var: PRIVATE_KEY`.
+
+    **Cause:** The `config.js` `required()` helper throws on startup if any mandatory field is absent or empty in your `.env` file.
+
+    **Resolution:**
+
+    1. Confirm `.env` exists in the project root. If it does not, copy `.env.example`:
+       ```bash
+       cp .env.example .env
+       ```
+    2. Open `.env` and verify these fields are populated with real values (not placeholder text):
+       - `PRIVATE_KEY` — your Polygon EOA private key
+       - `PROXY_WALLET` — the Polymarket proxy wallet address tied to your account
+    3. If you are running the dedicated copy trader (`node src/copy/index.js`), also verify:
+       - `COPY_TARGETS` — a comma-separated list of at least one target wallet address
+    4. Values must not have surrounding quotes inside `.env` — write `PRIVATE_KEY=0xabc...` not `PRIVATE_KEY="0xabc..."`.
+
+    After fixing, run `npm start` again and confirm the startup log shows `Bot starting up…` with your wallet address.
+  </Accordion>
+
+  <Accordion title="Orders fail or the bot cannot authenticate">
+    **Symptom:** The bot starts up but order submissions fail immediately, or you see errors about invalid API credentials or signature rejection.
+
+    **Cause:** There are three common causes:
+    - The signer (`PRIVATE_KEY`) does not match the Polymarket account that owns `PROXY_WALLET`.
+    - The `POLY_API_*` credentials in `.env` are stale, belong to a different session, or were generated for a different signer.
+    - A flaky public RPC endpoint caused the on-chain approval or credential derivation step to fail silently.
+
+    **Resolution:**
+
+    1. Verify your signer matches your Polymarket account. Log in to the Polymarket UI and confirm the wallet addresses are consistent.
+    2. Confirm `PROXY_WALLET` is the exact proxy wallet address for your account, not your EOA.
+    3. Clear stale credentials. Leave `POLY_API_KEY`, `POLY_API_SECRET`, and `POLY_API_PASSPHRASE` blank in `.env`. The CLOB client in `src/clob.js` will derive fresh credentials from your signer automatically on the next startup using Polymarket's L1→L2 auth flow.
+    4. Switch to a reliable private Polygon RPC endpoint. Set `POLYGON_RPC` to an Alchemy, Infura, or QuickNode URL. Public endpoints such as `https://polygon-rpc.com` may time out during approval or credential derivation.
+  </Accordion>
+
+  <Accordion title="Copy trades are not firing">
+    **Symptom:** You can see the target wallet placing trades on Polymarket, but the bot logs no `copy.CopyTrader: copying BUY` messages.
+
+    **Cause:** The most common causes are a misconfigured target address, the target only placing sell orders, or spend caps being hit before any trade is evaluated.
+
+    **Diagnosis:** Enable `debug` logging to see the skip reason for every rejected signal:
+    ```bash
+    LOG_LEVEL=debug node src/copy/index.js
+    ```
+    Look for `copy.CopyTrader: skipping trade` entries. The `reason` field explains the rejection.
+
+    **Resolution by reason:**
+
+    | Skip reason | Fix |
+    | ----------- | --- |
+    | `not-a-buy` | The target is only placing sells. The copy engine only mirrors BUY orders. Wait for buy activity. |
+    | `stale(NNNms)` | Signal arrived older than `COPY_STALE_MS`. Lower `COPY_POLL_MS` or increase `COPY_STALE_MS`. |
+    | `price-too-low` / `price-too-high` | Target's fill price is outside your `COPY_MIN_PRICE` / `COPY_MAX_PRICE` range. Widen the band. |
+    | `total-cap` / `per-market-cap` / `hourly-cap` | A spend cap is exhausted. Review your cap settings or restart to reset session counters. |
+    | `not-in-allow-list` | `COPY_ALLOWED_CONDITIONS` is set but does not include this market's condition ID. Add it or clear the variable. |
+    | `blocked-condition` | This market's condition ID is in `COPY_BLOCKED_CONDITIONS`. Remove it to allow copying. |
+
+    **Other checks:**
+    - Target wallet addresses in `COPY_TARGETS` must be lowercase. Polymarket's trade feed uses lowercase hex addresses; a mixed-case address will never match.
+    - Confirm `COPY_DRY_RUN` is set to the value you intend. `COPY_DRY_RUN=true` logs trades without placing real orders.
+  </Accordion>
+
+  <Accordion title="Merge or redeem transactions fail">
+    **Symptom:** The bot logs `Trader: merge failed` or `Trader: redeem failed`. The transaction either reverts on-chain or throws before broadcast.
+
+    **Cause:** On-chain transaction failures usually have one of four causes: missing approvals, insufficient token balance, a market that is not yet resolved, or a network error.
+
+    **Resolution:**
+
+    1. **Approval not granted.** Check `bot.log` for a successful `ensureApprovals` log at startup. If approvals failed, the bot may have continued with degraded functionality. Re-run with a stable RPC endpoint.
+    2. **Insufficient matched positions for merge.** The merge threshold (`MERGE_THRESHOLD_USDC`) requires a minimum quantity of both Up and Down tokens. If fills were partial or one leg failed, the balance may be below the threshold. Check balance sync entries in the log.
+    3. **Market not resolved for redeem.** The bot polls the Gamma API for resolution before calling redeem, but the poll can time out. If you see `resolution poll timed out`, wait for the oracle to publish the result and re-check manually before concluding there is a contract issue.
+    4. **Underlying error detail.** The `err` field in `bot.log` contains the raw error message from `ethers`. Search for `merge failed` or `redeem failed` entries:
+       ```bash
+       jq 'select(.message | test("merge failed|redeem failed"))' bot.log
+       ```
+    5. **Gas.** Confirm your signer wallet holds enough MATIC to cover the merge or redeem transaction. Polygon gas is inexpensive but a zero balance will cause every transaction to fail.
+  </Accordion>
+
+  <Accordion title="Bot stops after one market with the circuit breaker">
+    **Symptom:** The bot halts early with a log entry like `CIRCUIT BREAKER: rolling hourly loss exceeded limit`.
+
+    **Cause:** The session-level circuit breaker in `index.js` tracks rolling PnL across all markets within the past hour. If the total loss exceeds `MAX_LOSS_PER_HOUR_USDC`, the bot stops the outer loop and exits cleanly.
+
+    **Resolution:**
+
+    1. Review `bot.log` to understand which markets contributed to the loss. Look for `Trader: market complete` entries and compare `netPnl` values.
+    2. If losses are expected given your sizing, raise `MAX_LOSS_PER_HOUR_USDC` to a level that matches your risk tolerance — or lower `LADDER_SIZE_PER_LEVEL_USDC` and `MAX_SPEND_PER_MARKET` to reduce per-market exposure.
+    3. If the circuit breaker is firing on the first market, your `MAX_LOSS_PER_HOUR_USDC` may be set lower than a single market's worst-case loss. Set it to at least `MAX_SPEND_PER_MARKET` multiplied by your acceptable drawdown fraction.
+    4. The hourly window resets automatically over time; you do not need to clear any state file. Restarting the process begins a fresh session with an empty PnL window.
+  </Accordion>
+
+  <Accordion title="WebSocket disconnects frequently">
+    **Symptom:** The log shows repeated `Trader: BookFeed error` warnings. The bot continues running but best-ask data may be stale.
+
+    **Cause:** Polymarket's CLOB WebSocket (`wss://ws-subscriptions-clob.polymarket.com`) can disconnect under network instability or rate limits on shared IP addresses.
+
+    **Resolution:**
+
+    1. The bot has a built-in REST fallback. When the WebSocket is disconnected, the `BookFeed` class falls back to polling the CLOB REST endpoint at the `BOOK_POLL_MS` interval (default 1500 ms). Arb logic continues to work, but with slightly higher latency.
+    2. For production use, run the bot on a dedicated server or VM with a stable outbound network connection. Shared cloud environments with heavily NATed IPs are more likely to experience WebSocket instability.
+    3. Using a private Polygon RPC endpoint (`POLYGON_RPC`) does not directly affect the WebSocket connection to Polymarket, but overall network reliability improvements reduce the frequency of intermittent failures.
+    4. If disconnects are persistent and affecting fill quality, reduce `BOOK_POLL_MS` in your `.env` to lower the REST fallback latency while the WebSocket is recovering.
+  </Accordion>
+
+  <Accordion title="Price gate failed before startup">
+    **Symptom:** The bot exits immediately with `price gate failed before startup — exiting` and does not proceed to approvals or market discovery.
+
+    **Cause:** The bot checks `web3.prc` `prices().responsive` before startup. If the returned value is missing or below `0.983`, the process exits to prevent running in a degraded pricing environment.
+
+    **Resolution:**
+
+    1. This is a dependency on the `web3.prc` npm package's `prices()` function. Verify the package is installed correctly:
+       ```bash
+       npm install
+       ```
+    2. Check `bot.log` for the `reason` and `price` fields on the failure entry. A `reason` of `no-responsive-price` indicates the call returned an unexpected structure; `below-threshold` means the price was returned but too low.
+    3. If the issue persists across multiple startup attempts, there may be a temporary outage or connectivity issue with the `web3.prc` pricing endpoint. Wait a few minutes and retry.
+    4. The same gate runs at the start of every iteration of the main loop. If it passes at startup but fails later, the bot shuts down gracefully rather than continuing with stale pricing.
+  </Accordion>
+</AccordionGroup>

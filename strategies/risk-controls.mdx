@@ -1,0 +1,128 @@
+---
+title: "Risk controls and circuit breakers"
+description: "Built-in safety mechanisms in Polymarket Copy Trading Bot: per-market caps, inventory guardrails, combined-ask stops, and rolling loss circuit breakers."
+---
+
+The Polymarket Copy Trading Bot places live orders on Polygon and interacts with real USDC. Every spending decision passes through multiple independent safety layers before execution. These controls are not optional guardrails you can leave at default and ignore — they are the primary mechanism that prevents a misconfiguration, an API anomaly, or a bad market from turning a small test run into a large unexpected loss. Review each one before your first live session and set values that reflect the amount of capital you are genuinely comfortable losing.
+
+## Per-market controls (arbitrage engine)
+
+These parameters govern a single 5-minute BTC Up/Down window. They are checked in the arb loop on every iteration.
+
+### `MAX_SPEND_PER_MARKET`
+
+The total buy-side USDC budget for one market window. Once `totalSpent >= MAX_SPEND_PER_MARKET`, the bot stops placing both ladder orders and taker arb orders for that window (RULE 9). Existing resting orders are not cancelled at this point — they may still fill — but no new orders are submitted.
+
+Default: `400` USDC.
+
+### `MAX_TAKER_FILL_USDC`
+
+The maximum USDC the bot will spend in a single taker arb action. This caps the combined cost of each FOK pair buy, preventing a single arb trigger from consuming your entire per-market budget at once.
+
+Default: `100` USDC.
+
+### `COMBINED_ASK_STOP`
+
+A hard stop triggered when the combined best ask rises **above** 1.00. Under normal market conditions, `Up + Down ≈ $1.00`. A combined ask above `COMBINED_ASK_STOP` (default: `1.02`) indicates an abnormal book state — possibly a fat finger, stale quotes, or extreme one-sided demand. The bot sets `halted = true` and stops buying immediately.
+
+Default: `1.02`.
+
+### `MAX_INVENTORY_IMBALANCE_USDC`
+
+The bot tracks `balanceUp` and `balanceDown` in shares. If `|balanceUp - balanceDown|` exceeds `MAX_INVENTORY_IMBALANCE_USDC`, it means one leg filled significantly more than the other, creating directional exposure. At `1× threshold`, the bot logs a warning but continues buying. At `2× threshold`, it halts entirely.
+
+Default: `200` USDC.
+
+## Session-level controls
+
+These controls operate across the full trading session rather than a single market window.
+
+### `MAX_LOSS_PER_HOUR_USDC`
+
+A rolling 1-hour loss circuit breaker. The bot's PnL tracker (`PnlTracker`) records buy costs, merge proceeds, and redeem proceeds. On each iteration of the main market-scanning loop, if the rolling 1-hour realized loss exceeds this threshold, the bot stops opening new market windows for the rest of the session.
+
+Default: `300` USDC/hour.
+
+### `STOP_BUYING_BEFORE_CLOSE`
+
+How many seconds before window close the bot stops all new buy activity (RULE 1). This prevents fills in the final seconds of a window where there is no time to merge matched pairs or respond to adverse price moves.
+
+Default: `15` seconds.
+
+## Copy trading controls
+
+These parameters apply to the dedicated copy engine (`src/copy/`). They form multiple independent spend ceilings that are applied together — the effective size for any trade is the minimum across all of them.
+
+| Variable | Default | Description |
+|---|---|---|
+| `COPY_MAX_USDC_PER_TRADE` | 50 | Maximum USDC spent on a single copied trade |
+| `COPY_MAX_USDC_PER_MARKET` | 200 | Cumulative USDC cap per condition ID for this session |
+| `COPY_MAX_USDC_PER_HOUR` | 500 | Rolling 1-hour USDC spend cap across all copied trades |
+| `COPY_MAX_USDC_TOTAL` | 2000 | Lifetime session cap; bot stops copying once this is reached |
+| `COPY_STALE_MS` | 8000 | Reject signals older than this many milliseconds at detection time |
+| `COPY_MAX_SLIPPAGE` | 0.03 | Maximum cents above the target's fill price you will pay |
+| `COPY_MIN_PRICE` | 0.02 | Ignore positions trading below this price (dust / illiquid) |
+| `COPY_MAX_PRICE` | 0.97 | Ignore positions trading above this price (near-certainty) |
+
+The hourly cap uses a rolling window — each recorded spend entry is pruned once it is more than 60 minutes old. This means the cap resets gradually rather than all at once at the top of each hour.
+
+## Circuit breaker implementation
+
+The three circuit breakers from RULE 8 are consolidated in the `_checkCircuitBreakers` method in `src/trader.js`. This method is called on every iteration of the arb loop, before any order is placed:
+
+```javascript src/trader.js
+_checkCircuitBreakers() {
+  if (this.halted) return true;
+
+  // Rule 8a: Inventory imbalance cap
+  const imbalanceUsdc = Math.abs(this.balanceUp - this.balanceDown);
+  if (imbalanceUsdc > MAX_INVENTORY_IMBALANCE) {
+    this.log.warn('Trader: RULE-8 inventory imbalance circuit breaker', {
+      imbalanceUsdc: imbalanceUsdc.toFixed(2),
+      balanceUp:     this.balanceUp.toFixed(4),
+      balanceDown:   this.balanceDown.toFixed(4),
+    });
+    // Don't halt entirely — just skew future buys toward the under-held side.
+    // We signal this via `halted` only if imbalance is extreme (>= 2×).
+    if (imbalanceUsdc > MAX_INVENTORY_IMBALANCE * 2) {
+      this.halted = true;
+      return true;
+    }
+  }
+
+  // Rule 9: Per-market spend cap
+  if (this.totalSpent >= MAX_SPEND_PER_MARKET) {
+    this.log.info('Trader: RULE-9 spend cap reached', { totalSpent: this.totalSpent.toFixed(2) });
+    this.halted = true;
+    return true;
+  }
+
+  return false;
+}
+```
+
+The combined-ask circuit breaker (RULE 8, `COMBINED_ASK_STOP`) is checked inside `_tryArb` rather than here, because it is triggered by the live book state rather than internal inventory or spend accounting.
+
+When `_checkCircuitBreakers` returns `true`, the arb loop breaks immediately. The market then proceeds directly to the cancellation and redemption phases — existing positions are still settled normally.
+
+## Recommended conservative first-run values
+
+These values prioritize safety over returns. Adjust them upward only after you have verified the bot's behavior in dry run and across several live windows.
+
+| Variable | Conservative value | Notes |
+|---|---|---|
+| `MAX_SPEND_PER_MARKET` | 50 | Limits exposure per 5-minute window |
+| `MAX_TAKER_FILL_USDC` | 20 | Caps each individual arb action |
+| `MAX_INVENTORY_IMBALANCE_USDC` | 30 | Tight imbalance tolerance |
+| `COMBINED_ASK_STOP` | 1.01 | Halt on any abnormal book state |
+| `MAX_LOSS_PER_HOUR_USDC` | 50 | Low rolling loss limit for first sessions |
+| `TARGET_EDGE` | 0.03 | Only fire arb at 3+ cents of edge |
+| `COPY_MAX_USDC_PER_TRADE` | 5 | Very small fixed size while validating signals |
+| `COPY_MAX_USDC_PER_HOUR` | 50 | Conservative hourly copy budget |
+| `COPY_MAX_USDC_TOTAL` | 100 | Hard session cap for first copy run |
+| `COPY_STALE_MS` | 5000 | Only act on very fresh signals |
+| `COPY_DRY_RUN` | `true` | Validate filter logic before going live |
+
+<Warning>
+  These controls will not protect you from every possible failure mode. Network partitions, RPC downtime, Polymarket API outages, or bugs in your `.env` configuration can all cause unexpected behavior that no in-process circuit breaker can catch. Always monitor your wallet balance and open positions externally, and never run the bot with more USDC in your proxy wallet than you can afford to lose.
+</Warning>

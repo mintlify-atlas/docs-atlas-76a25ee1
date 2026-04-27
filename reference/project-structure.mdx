@@ -1,0 +1,136 @@
+---
+title: "Project structure and file guide"
+description: "Directory layout and module responsibilities for the Polymarket Copy Trading Bot codebase, covering each source file's role in the trading lifecycle."
+---
+
+The Polymarket Copy Trading Bot is organised as a single Node.js package under `src/`. Each module has a narrow responsibility — market discovery, order execution, on-chain transactions, copy-trading, and risk accounting are all separated so you can read, test, or replace any one layer without touching the others. The sections below map every file to its role in the trading lifecycle and describe the import relationships between modules.
+
+## Directory layout
+
+```text
+.
+|-- .env.example
+|-- package.json
+|-- img/
+|-- src/
+|   |-- index.js
+|   |-- trader.js
+|   |-- copy-trader.js
+|   |-- market.js
+|   |-- clob.js
+|   |-- onchain.js
+|   |-- pnl.js
+|   |-- logger.js
+|   `-- copy/
+|       |-- index.js
+|       |-- activityFeed.js
+|       |-- copyTrader.js
+|       `-- config.js
+`-- README.md
+```
+
+## Source file responsibilities
+
+<AccordionGroup>
+  <Accordion title="src/index.js — main bot lifecycle">
+    The top-level entry point for the arbitrage runtime. On startup it validates configuration, runs on-chain approvals, and derives CLOB credentials from the signer. The outer loop then:
+
+    1. Checks the `web3.prc` price gate before each iteration.
+    2. Discovers the next `btc-updown-5m` market window.
+    3. Spawns a `Trader` instance and tracks it as a non-blocking async task so the resolve tail of market _N_ overlaps with the live phase of market _N+1_.
+    4. Evaluates the rolling hourly-loss circuit breaker at the session level.
+    5. Handles `SIGINT` / `SIGTERM` with a 5-second grace period.
+
+    If `TARGET_WALLET` is set, `index.js` also creates an integrated `CopyTrader` instance that snapshots existing positions and mirrors future buy increases.
+  </Accordion>
+
+  <Accordion title="src/trader.js — per-market state machine">
+    Implements the full lifecycle for a single BTC Up/Down market window as a state machine (`INIT → LIVE → CLOSING → CANCELLED → RESOLVING → DONE`). It posts the dual-sided limit ladder at open, runs the arb and merge loop, cancels orders at close, and redeems after oracle resolution. See [Trader class reference](/reference/trader) for the full method-level documentation.
+  </Accordion>
+
+  <Accordion title="src/market.js — Polymarket API helpers">
+    Thin wrappers around the Polymarket Gamma API and Data API. Provides:
+    - `fetchMarket(slug)` / `fetchMarketWithRetry(slug, retries, delayMs)` — resolve a market slug to its token IDs and window timestamp.
+    - `nextWindowTs()` / `slugFor(ts)` — compute the next 5-minute window boundary and the corresponding market slug.
+    - `waitForResolution(slug, timeoutMs, pollMs)` — poll until the Gamma API reports the market as resolved.
+    - `msUntil(unixTs)` — milliseconds from now until a Unix timestamp.
+  </Accordion>
+
+  <Accordion title="src/clob.js — CLOB REST and WebSocket client">
+    Wraps Polymarket's Central Limit Order Book API. Manages the L1-to-L2 authentication flow (derive or refresh API credentials from the signer), signs and posts limit and FOK/IOC orders, cancels by market or globally, and exposes the `BookFeed` class for real-time WebSocket best-ask updates. All order methods are stateless class statics on `ClobClient`; `BookFeed` is an `EventEmitter` that emits `update` and `error`.
+  </Accordion>
+
+  <Accordion title="src/onchain.js — Polygon transactions">
+    Handles every on-chain call against the Polygon blockchain:
+    - `ensureApprovals()` — grants USDC allowance to the exchange contract and CTF allowance to the adapter if not already set.
+    - `getTokenBalances(tokenIds)` — reads ERC-1155 position balances for the proxy wallet.
+    - `mergePositions(conditionId, amount)` — calls `mergePositions` on the CTF Exchange adapter to convert matched Up/Down pairs back to USDC.
+    - `redeemPositions(conditionId)` — calls `redeemPositions` after oracle resolution.
+    - `getSigner()` — constructs an `ethers.Wallet` from `PRIVATE_KEY` connected to the configured Polygon RPC.
+  </Accordion>
+
+  <Accordion title="src/copy-trader.js — integrated wallet mirroring">
+    A lightweight copy module used by `src/index.js` when `TARGET_WALLET` is configured. It snapshots the target wallet's current positions through the Polymarket Data API, then polls for position increases at `COPY_TRADE_POLL_MS` intervals. When `totalBought` for a market grows, it fires a proportional IOC buy using `ClobClient`. Unlike the dedicated copy engine under `src/copy/`, this module mirrors position-delta changes rather than individual trade events.
+  </Accordion>
+
+  <Accordion title="src/copy/activityFeed.js — high-frequency trade polling">
+    Polls `GET /trades?user=<addr>` on the Polymarket Data API at configurable intervals (default 250 ms per target) to detect fresh fills for one or more target wallets. Uses keep-alive HTTP agents to minimise per-request overhead, skips a polling tick if the previous request is still outstanding, and deduplicates fills with a bounded FIFO set keyed by `transactionHash + asset`. The first poll per target is used only to warm up the seen-set, so startup backlogs are never emitted. See [Copy engine reference](/reference/copy-engine) for full documentation.
+  </Accordion>
+
+  <Accordion title="src/copy/copyTrader.js — copy execution engine">
+    Consumes `ActivityFeed` trade events and, after a filter and sizing pipeline, fires IOC buy orders via `ClobClient.postIOCBuy`. Tracks `totalSpent`, per-market spend, and a sliding hourly spend window for cap enforcement. Emits `'copy'` on success and `'copy-failed'` on order error. See [Copy engine reference](/reference/copy-engine) for the full method reference.
+  </Accordion>
+
+  <Accordion title="src/copy/config.js — copy-trading configuration">
+    Reads and validates all `COPY_*` environment variables at module load time. Exports typed constants for sizing mode, spend caps, price filters, staleness threshold, poll interval, allow/block lists, and `COPY_DRY_RUN`. No I/O occurs here; all exports are plain values or `Set` instances.
+  </Accordion>
+
+  <Accordion title="src/config.js — centralised configuration">
+    Validates and exports the main strategy configuration: `PRIVATE_KEY`, `PROXY_WALLET`, ladder parameters, edge thresholds, spend caps, circuit-breaker values, and polling intervals. Throws at import time if a required variable is missing, so misconfiguration is caught before any network calls are made.
+  </Accordion>
+
+  <Accordion title="src/logger.js — structured logger">
+    Creates a `winston` logger with two transports: coloured structured output to `stdout` and JSON to `bot.log`. Exposes a `marketLogger(slug)` helper that prefixes every message with the market slug, making multi-market log output easy to grep.
+  </Accordion>
+
+  <Accordion title="src/pnl.js — P&L tracking">
+    Maintains per-market buy, merge, and redeem records in memory. Exposes `recordBuy`, `recordMerge`, and `recordRedeem` for use by `Trader`, and `rollingHourlyLoss()` for the session-level circuit breaker in `index.js`. `printSessionSummary()` writes a formatted table to the logger after each market completes.
+  </Accordion>
+</AccordionGroup>
+
+## Module dependency overview
+
+The dependency graph is intentionally narrow: nothing in the leaf modules (`logger`, `config`, `pnl`) imports from higher-level modules, and the `copy/` subtree is self-contained except for its use of `ClobClient` and the shared logger.
+
+```text
+src/index.js
+  ├── src/config.js
+  ├── src/logger.js
+  ├── src/clob.js          ← src/config.js, src/logger.js
+  ├── src/onchain.js       ← src/config.js, src/logger.js
+  ├── src/market.js        ← src/config.js, src/logger.js
+  ├── src/trader.js        ← src/config.js, src/clob.js,
+  │                           src/onchain.js, src/market.js,
+  │                           src/logger.js
+  ├── src/pnl.js           ← src/logger.js
+  └── src/copy-trader.js   ← src/config.js, src/clob.js,
+                              src/market.js, src/logger.js
+
+src/copy/index.js
+  ├── src/copy/config.js
+  ├── src/copy/activityFeed.js  ← src/config.js, src/logger.js,
+  │                                src/copy/config.js
+  └── src/copy/copyTrader.js    ← src/copy/config.js,
+                                   src/clob.js, src/logger.js
+```
+
+## Trading mode entrypoints
+
+| `TRADING_MODE` | Entrypoint | Description |
+|---|---|---|
+| `arb` (default) | `src/index.js` | BTC Up/Down arbitrage lifecycle with optional integrated copy watcher |
+| `copy` | `src/copy/index.js` | Dedicated buy-only copy trader; runs `ActivityFeed` + `CopyTrader` without the arb engine |
+
+<Note>
+  Set `COPY_DRY_RUN=true` when first running either copy path. The bot logs every trade it would copy without placing real orders, so you can validate your filter and sizing configuration risk-free.
+</Note>

@@ -1,133 +1,73 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Polymarket Copy Trading Bot"
+description: "A production-ready Node.js bot for automated arbitrage and copy trading on Polymarket's BTC Up/Down markets running on Polygon."
 ---
 
-## Setting up
+The Polymarket Copy Trading Bot is a fully operational Node.js runtime that automates trading on Polymarket's recurring 5-minute BTC Up/Down markets. It includes both a dual-sided arbitrage engine and a configurable copy-trading system for following target wallets — with real CLOB authentication, on-chain Polygon transactions, WebSocket order-book tracking, and built-in risk controls.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install, configure, and run your first trading session in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Requirements" icon="list-check" href="/requirements">
+    Node.js version, wallet setup, MATIC gas, and RPC prerequisites
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Arbitrage Strategy" icon="chart-line" href="/strategies/arbitrage-bot">
+    How the 9-rule BTC Up/Down arb engine works and when it fires
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Copy Trading" icon="copy" href="/strategies/copy-trading">
+    Mirror a target wallet's buys with configurable size and spend caps
   </Card>
-</Columns>
+  <Card title="Configuration" icon="sliders" href="/configuration/overview">
+    All environment variables, risk parameters, and ladder settings
+  </Card>
+  <Card title="Risk Controls" icon="shield" href="/strategies/risk-controls">
+    Circuit breakers, spend caps, and inventory guardrails explained
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Two trading modes
 
-Everything you need to create world-class documentation.
+The bot ships with two distinct operating modes selected via the `TRADING_MODE` environment variable.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Choose your mode">
+    Set `TRADING_MODE=arb` to run the BTC Up/Down arbitrage engine, or `TRADING_MODE=copy` to run the dedicated buy-only copy trader.
+  </Step>
+  <Step title="Configure your wallet">
+    Set `PRIVATE_KEY` and `PROXY_WALLET` in your `.env` file. These are required for both modes.
+  </Step>
+  <Step title="Set risk limits">
+    Configure `MAX_SPEND_PER_MARKET`, `MAX_LOSS_PER_HOUR_USDC`, and copy-trading caps before your first run.
+  </Step>
+  <Step title="Run the bot">
+    Execute `npm start` for arbitrage mode or `npm run copy` for copy-trading mode. Use `COPY_DRY_RUN=true` to test copy logic without placing real orders.
+  </Step>
+</Steps>
 
-## Make your content agent ready
+## Key capabilities
 
-Make your docs work for humans and AI agents alike.
+<CardGroup cols={2}>
+  <Card title="Dual-sided ladder execution" icon="layer-group">
+    Posts limit buy orders across 23 configurable price levels on both Up and Down outcomes at market open
+  </Card>
+  <Card title="Taker arbitrage" icon="bolt">
+    Fires Fill-Or-Kill paired buys when combined best ask falls below your configured edge threshold
+  </Card>
+  <Card title="On-chain merge and redeem" icon="link">
+    Automatically merges matched YES/NO pairs back to USDC and redeems winning positions after oracle resolution
+  </Card>
+  <Card title="Copy trading engine" icon="users">
+    Polls target wallet trades at 250ms intervals and mirrors buys with FIXED, MIRROR, or RATIO sizing
+  </Card>
+  <Card title="WebSocket order book" icon="wifi">
+    Tracks live best asks via Polymarket's CLOB WebSocket with automatic REST fallback
+  </Card>
+  <Card title="Session circuit breakers" icon="circle-stop">
+    Halts trading when hourly loss, inventory imbalance, or per-market spend caps are exceeded
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Warning>
+  This software places live blockchain and market orders on Polygon. It is intended for experienced users who fully understand the strategy, wallet setup, gas implications, and market risks. Always start with conservative spend caps and test copy workflows with `COPY_DRY_RUN=true`.
+</Warning>

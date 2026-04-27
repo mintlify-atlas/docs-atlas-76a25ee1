@@ -1,0 +1,256 @@
+---
+title: "Trader class: per-market state machine"
+description: "Full reference for the Trader class in src/trader.js — state phases, methods, arb loop logic, merge triggers, and redeem flow for each BTC Up/Down market."
+---
+
+The `Trader` class in `src/trader.js` owns the entire lifecycle of a single BTC Up/Down market window. From the moment the window opens to the final redeem transaction, every decision — ladder posting, arb firing, merge timing, cancellation, and redemption — flows through this class. The `Trader` is a self-contained async state machine: call `run()` and it returns only after the market is fully settled.
+
+## Constructor
+
+```javascript
+new Trader(market, wallet, pnl)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `market` | `object` | Market object returned by `market.fetchMarket()`. Contains `conditionId`, `upToken.tokenId`, `downToken.tokenId`, `slug`, and `windowTs`. |
+| `wallet` | `ethers.Wallet` | Signer used for all CLOB order signing and on-chain transactions. |
+| `pnl` | `PnlTracker` | Shared session-level P&L tracker. Records buys, merges, and redeems for the rolling hourly-loss circuit breaker. |
+
+## State machine phases
+
+The `phase` property transitions in a fixed sequence. Once a terminal phase is reached it never changes.
+
+| Phase | Description |
+|---|---|
+| `INIT` | Pre-open. The `Trader` has been constructed but is waiting for the market window to start. |
+| `LIVE` | Window is open. The ladder has been posted and the arb/merge loop is running. |
+| `CLOSING` | The last `STOP_BUYING_BEFORE_CLOSE` seconds of the window. No new buy orders are placed. |
+| `CANCELLED` | Orders have been cancelled via CLOB API. A final forced merge runs in this phase. |
+| `RESOLVING` | Waiting for the Polymarket oracle to report the winning side. |
+| `DONE` | Redeem transaction has been submitted (or skipped if no tokens are held). The market is complete. |
+| `HALTED` | A circuit breaker fired. The arb loop exits early; the cancellation and redeem flow still runs. |
+
+## Instance properties
+
+| Property | Type | Description |
+|---|---|---|
+| `balanceUp` | `number` | Shares of the Up-outcome token held (estimated from fills; reconciled via `_syncBalances`). |
+| `balanceDown` | `number` | Shares of the Down-outcome token held. |
+| `totalSpent` | `number` | Total USDC spent across all fills in this market (used for the RULE 9 spend cap). |
+| `mergedUsdc` | `number` | USDC recovered through on-chain `mergePositions` calls. |
+| `redeemedUsdc` | `number` | Estimated USDC from the final `redeemPositions` call (winning shares × $1). |
+| `openOrders` | `Map<string, {tokenId, price, shares}>` | Live order tracking keyed by CLOB order ID. Populated in `_safeLimitBuy`, cleared in `_cancelAllOrders`. |
+| `phase` | `string` | Current state machine phase (one of the `PHASE` constants above). |
+| `halted` | `boolean` | Set to `true` when a circuit breaker fires. Checked at the top of every arb loop iteration. |
+
+## Public method: `run()`
+
+```javascript
+await trader.run()
+```
+
+Drives the complete market lifecycle and resolves when the market reaches `DONE`. The sequence is:
+
+1. Sleep until `windowTs + 1 s` (RULE 1 entry buffer).
+2. Start the WebSocket `BookFeed` for real-time best-ask updates.
+3. Call `_postLadder()` to post the dual-sided limit ladder.
+4. Call `_arbLoop()` until the window closes or a circuit breaker fires.
+5. Transition to `CANCELLED`, call `_cancelAllOrders()`, stop the feed.
+6. Call `_tryMerge({ force: true })` for any remaining matched pairs.
+7. Transition to `RESOLVING`, call `_redeemPhase()`.
+8. Transition to `DONE`, log the final P&L summary.
+
+Traders for consecutive markets run concurrently. The outer loop in `src/index.js` spawns each `Trader` as a non-blocking async task, so while market _N_ is in its `RESOLVING` phase (up to ~10 minutes after window close), market _N+1_ is already `LIVE`.
+
+## Internal methods
+
+### `_postLadder(upTokenId, downTokenId)`
+
+Posts `LADDER_LEVELS.length × 2` limit buy orders concurrently — one on each configured price level for each token side. All calls are fired with `Promise.allSettled` so a single failure does not block the others.
+
+```javascript
+async _postLadder(upTokenId, downTokenId) {
+  const posts = [];
+  for (const price of LADDER_LEVELS) {
+    const shares = LADDER_SIZE_PER_LEVEL / price;
+    posts.push(this._safeLimitBuy(upTokenId,   price, shares));
+    posts.push(this._safeLimitBuy(downTokenId, price, shares));
+  }
+  // Fire all limit orders concurrently (REST calls are independent)
+  await Promise.allSettled(posts);
+}
+```
+
+Each level's share count is computed as `LADDER_SIZE_PER_LEVEL / price` so that the USDC cost per level stays constant regardless of price. The `_safeLimitBuy` wrapper enforces the RULE 9 per-market cap before sending.
+
+---
+
+### `_arbLoop(windowClose, conditionId, upTokenId, downTokenId)`
+
+The main trading loop. Runs until the window close minus `STOP_BUYING_BEFORE_CLOSE` seconds (RULE 1), or until a circuit breaker halts the trader (RULE 8). Each iteration:
+
+1. Checks the window-close deadline.
+2. Calls `_checkCircuitBreakers()`.
+3. Calls `_tryArb()` to evaluate the current best asks.
+4. Calls `_tryMerge()` if matched pairs exceed the merge threshold.
+5. Syncs on-chain balances every 30 seconds.
+6. Sleeps for `BOOK_POLL_MS` before the next iteration.
+
+```javascript
+async _arbLoop(windowClose, conditionId, upTokenId, downTokenId) {
+  while (true) {
+    const now = Math.floor(Date.now() / 1000);
+    if (now >= windowClose - STOP_BUYING_BEFORE_CLOSE) break;
+    if (this._checkCircuitBreakers()) break;
+    await this._tryArb(upTokenId, downTokenId);
+    await this._tryMerge(conditionId);
+    if (now % 30 === 0) await this._syncBalances(upTokenId, downTokenId);
+    await sleep(BOOK_POLL_MS);
+  }
+}
+```
+
+---
+
+### `_tryArb(upTokenId, downTokenId)`
+
+Reads `_bestAskUp` and `_bestAskDown` (updated by the WebSocket feed) and fires a paired FOK buy when `upAsk.price + downAsk.price < 1 - TARGET_EDGE` (RULE 3).
+
+Both legs are fired simultaneously with `Promise.allSettled`. If both succeed, `totalSpent`, `balanceUp`, and `balanceDown` are updated and the fills are recorded in `PnlTracker`. If one leg fails, `_syncBalances` is called immediately to reconcile the directional risk.
+
+The combined-ask circuit breaker (RULE 8c) also lives here: if `combined > COMBINED_ASK_STOP`, `halted` is set to `true` and the method returns without placing an order.
+
+```javascript
+// RULE 3: fire if combined ask < (1 - TARGET_EDGE)
+if (combined >= 1 - TARGET_EDGE) return;
+
+const [upRes, downRes] = await Promise.allSettled([
+  ClobClient.postFOKBuy(this.wallet, upTokenId,   upAsk.price,   upSpendUsdc),
+  ClobClient.postFOKBuy(this.wallet, downTokenId, downAsk.price, downSpendUsdc),
+]);
+```
+
+---
+
+### `_tryMerge(conditionId, { force })`
+
+Merges matched Up/Down pairs back into USDC via `onchain.mergePositions`. The number of pairs available is `Math.min(balanceUp, balanceDown)`.
+
+- In the normal arb loop the merge fires only when `pairs >= MERGE_THRESHOLD_USDC`.
+- At window close (`force: true`) all remaining pairs are merged regardless of size.
+- A `_merging` flag prevents concurrent calls if the loop cycles faster than the on-chain transaction confirms.
+
+```javascript
+async _tryMerge(conditionId, { force = false } = {}) {
+  if (this._merging) return;
+  const pairs = Math.min(this.balanceUp, this.balanceDown);
+  if (pairs < MERGE_THRESHOLD_USDC && !force) return;
+  if (pairs < 0.001) return;
+
+  this._merging = true;
+  try {
+    const txHash = await mergePositions(conditionId, pairs);
+    this.balanceUp   -= pairs;
+    this.balanceDown -= pairs;
+    this.mergedUsdc  += pairs;
+  } finally {
+    this._merging = false;
+  }
+}
+```
+
+---
+
+### `_redeemPhase(conditionId, windowClose)`
+
+Waits for at least `REDEEM_DELAY_AFTER_CLOSE` seconds after window close, then polls the Gamma API via `waitForResolution` until the market is marked resolved. If the poll times out (400 s default), it attempts to redeem anyway.
+
+Redemption is skipped if `balanceUp + balanceDown < 0.001`. When redeemed, `redeemedUsdc` is estimated as `Math.max(balanceUp, balanceDown)` (the winning side's shares at $1 each). The `PnlTracker` receives the final `recordRedeem` call.
+
+---
+
+### `_cancelAllOrders(conditionId)`
+
+Calls `ClobClient.cancelMarket(conditionId)` to cancel all orders for this specific market in a single API call. If that fails (e.g. the market ID is stale), it falls back to `ClobClient.cancelAll()`. On success `openOrders` is cleared.
+
+```javascript
+async _cancelAllOrders(conditionId) {
+  try {
+    await ClobClient.cancelMarket(conditionId);
+    this.openOrders.clear();
+  } catch (err) {
+    await ClobClient.cancelAll();
+    this.openOrders.clear();
+  }
+}
+```
+
+---
+
+### `_checkCircuitBreakers()`
+
+Returns `true` if the arb loop should stop. Three conditions are evaluated:
+
+| Condition | Behaviour |
+|---|---|
+| `halted === true` | Already halted by a prior check; return immediately. |
+| `imbalanceUsdc > MAX_INVENTORY_IMBALANCE` | Log a warning. If imbalance exceeds `2 × MAX_INVENTORY_IMBALANCE`, set `halted = true` and halt. |
+| `totalSpent >= MAX_SPEND_PER_MARKET` | RULE 9: set `halted = true` and halt. |
+
+```javascript
+_checkCircuitBreakers() {
+  if (this.halted) return true;
+  const imbalanceUsdc = Math.abs(this.balanceUp - this.balanceDown);
+  if (imbalanceUsdc > MAX_INVENTORY_IMBALANCE * 2) {
+    this.halted = true;
+    return true;
+  }
+  if (this.totalSpent >= MAX_SPEND_PER_MARKET) {
+    this.halted = true;
+    return true;
+  }
+  return false;
+}
+```
+
+---
+
+### `_startFeed(tokenIds)`
+
+Constructs a `BookFeed` (from `src/clob.js`) for the Up and Down token IDs and registers handlers:
+
+- `'update'` → updates `_bestAskUp` or `_bestAskDown` depending on which `tokenId` arrived.
+- `'error'` → logs a warning; the feed reconnects internally.
+
+The feed is stopped in `run()` immediately after `_cancelAllOrders()` returns.
+
+---
+
+### `_safeLimitBuy(tokenId, price, shares)`
+
+Posts a single limit buy order via `ClobClient.postLimitBuy`. Before posting, it checks that `totalSpent + (price × shares) <= MAX_SPEND_PER_MARKET` (RULE 9). If the cap would be exceeded the method returns silently without placing an order.
+
+On success the order ID is stored in `openOrders`. Spend is **not** incremented here because the order may not fill; actual fill accounting happens in `_tryArb` or via the fill feed.
+
+---
+
+### `_syncBalances(upTokenId, downTokenId)`
+
+Calls `onchain.getTokenBalances` to read the proxy wallet's on-chain ERC-1155 balances and reconcile `balanceUp` and `balanceDown`. This runs every 30 arb-loop iterations as a fallback in case WebSocket fill events are missed.
+
+## Concurrent task model
+
+The outer loop in `src/index.js` tracks all in-flight `Trader` tasks in a `Set`. When a new market window opens, a fresh `Trader` is spawned without `await` — the previous `Trader` continues running in its `RESOLVING` or `DONE` phase concurrently. This means two traders may be active simultaneously during the oracle-resolution tail of the preceding market.
+
+```javascript
+// Spawn Trader (non-blocking for the resolve tail)
+const trader = new Trader(market, wallet, pnl);
+const task   = trader.run().then(() => {
+  runningTasks.delete(task);
+  pnl.printSessionSummary();
+});
+runningTasks.add(task);
+```
+
+On graceful shutdown, `Promise.allSettled([...runningTasks])` waits for every in-flight trader to reach its terminal phase before the process exits.

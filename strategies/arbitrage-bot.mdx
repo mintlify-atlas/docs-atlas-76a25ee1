@@ -1,0 +1,150 @@
+---
+title: "BTC Up/Down arbitrage strategy explained"
+description: "How the Polymarket Copy Trading Bot discovers BTC 5-minute markets, posts dual-sided ladders, fires taker arb orders, merges pairs, and redeems after resolution."
+---
+
+The arbitrage engine in `src/trader.js` exploits a structural property of Polymarket's complementary-token markets: if you hold one Up share and one Down share, exactly one of them resolves to $1. That means a paired position bought for less than $1.00 combined is risk-free profit. The bot discovers fresh 5-minute BTC Up/Down windows, posts a limit ladder on both sides to capture passive edge, and fires aggressive taker orders whenever the live combined ask falls below its target threshold — all within a strict set of nine trading rules reverse-engineered from on-chain wallet activity.
+
+## How BTC Up/Down 5-minute markets work
+
+Each BTC Up/Down market resolves in one 5-minute window. Polymarket mints two complementary ERC-1155 tokens — **Up** and **Down** — for every window. Because the outcome is binary, one token always settles at $1 and the other at $0. The key property is:
+
+> **Up price + Down price = $1.00 at fair value**
+
+In practice, the combined best ask briefly dips below $1.00 due to order book microstructure, latency, and liquidity imbalances. The bot buys both sides simultaneously when this combined ask is sufficiently below $1.00 — capturing the spread as locked-in profit regardless of which direction BTC moves.
+
+## The nine trading rules
+
+The `Trader` class (`src/trader.js`) implements nine rules that govern every aspect of its behavior.
+
+**RULE 0 — Universe filter**
+Applied before a `Trader` is even constructed. Only markets matching the `btc-updown-5m` slug pattern pass through. All other markets are ignored.
+
+**RULE 1 — Entry and closing windows**
+The bot waits until the market window opens (plus a 1-second buffer for creation lag), then trades actively. It stops placing new buy orders `STOP_BUYING_BEFORE_CLOSE` seconds (default: 15s) before the window ends to avoid fills that can't be merged in time.
+
+**RULE 2 — Dual-sided limit ladder**
+At window open, the bot posts limit buy orders at every configured price level (`LADDER_LEVELS`) on both the Up and Down tokens. All orders are fired concurrently via `Promise.allSettled` — the independent REST calls don't need to be serialized.
+
+**RULE 3 — Aggressive taker when edge is available**
+In the main arb loop, if the combined best ask (Up ask + Down ask) is below `1 - TARGET_EDGE`, the bot fires Fill-Or-Kill buy orders on both sides simultaneously. The edge threshold (default: `0.02`) means it only fires when it can capture at least 2 cents per dollar of combined position.
+
+**RULE 4 — Merge matched pairs within ~10s**
+Whenever `balanceUp` and `balanceDown` are both non-zero and their minimum exceeds `MERGE_THRESHOLD_USDC`, the bot calls `mergePositions` on-chain to convert the matched pair back into USDC immediately. This frees capital and removes market risk.
+
+**RULE 5 — Never post a sell order**
+The bot only ever places buy orders. There are no sell orders anywhere in the code. The profit path is always merge (for matched pairs) or redeem (for winning tokens after resolution) — never a market sell.
+
+**RULE 6 — Cancel all orders at window close (t=300)**
+At the end of the arb loop, the bot cancels all open resting orders by calling `ClobClient.cancelMarket(conditionId)` before moving to the resolution phase.
+
+**RULE 7 — Redeem winning tokens at t≈600**
+After the oracle resolves the market (polled via the Gamma API), the bot redeems whichever token won by calling `redeemPositions(conditionId)` on-chain. It waits at least `REDEEM_DELAY_AFTER_CLOSE` seconds (default: 320s) after window close before attempting the redeem.
+
+**RULE 8 — Three circuit breakers**
+Three conditions will halt the bot mid-window. See [Risk controls](/strategies/risk-controls) for full details.
+
+**RULE 9 — Per-market capital cap**
+The bot tracks cumulative USDC spent on each window. Once `totalSpent >= MAX_SPEND_PER_MARKET`, it halts buying for that window. This is enforced in both `_safeLimitBuy` (ladder) and `_tryArb` (taker).
+
+## Market lifecycle
+
+<Steps>
+  <Step title="Wait for window open">
+    The `Trader` sleeps until `windowTs + 1000ms`. A 1-second buffer allows Polymarket's market creation to propagate before orders are placed.
+  </Step>
+  <Step title="Post the ladder (RULE 2)">
+    `_postLadder` iterates over every price in `LADDER_LEVELS` (default: 23 levels from 0.02 to 0.98) and fires `LADDER_SIZE_PER_LEVEL / price` shares on both the Up and Down token concurrently. All 46 REST calls run in a single `Promise.allSettled`.
+  </Step>
+  <Step title="Monitor live best asks via WebSocket">
+    `_startFeed` opens a `BookFeed` WebSocket subscription on both token IDs. On every `update` event, `_bestAskUp` and `_bestAskDown` are updated in memory. This is the price source for taker arb decisions.
+  </Step>
+  <Step title="Fire taker arb orders when edge is available (RULE 3)">
+    The arb loop calls `_tryArb` on every iteration. If the combined ask is below the threshold and budget remains, it fires FOK buys on both legs simultaneously. See the [arb trigger formula](#arb-trigger-formula) below.
+  </Step>
+  <Step title="Merge matched pairs (RULE 4)">
+    After each arb attempt, `_tryMerge` checks whether the minimum of `balanceUp` and `balanceDown` exceeds `MERGE_THRESHOLD_USDC`. If so, it calls `mergePositions` on-chain to immediately crystallize USDC profit.
+  </Step>
+  <Step title="Stop buying near window close, cancel orders (RULES 1 & 6)">
+    When `now >= windowClose - STOP_BUYING_BEFORE_CLOSE`, the arb loop exits. The bot then cancels all resting orders via `_cancelAllOrders` and runs a final forced merge.
+  </Step>
+  <Step title="Wait for oracle resolution and redeem (RULE 7)">
+    The bot polls the Gamma API until the market resolves, then calls `redeemPositions` for any remaining token balance. Net PnL — `mergedUsdc + redeemedUsdc - totalSpent` — is logged when complete.
+  </Step>
+</Steps>
+
+## Arb trigger formula
+
+The taker arb fires when the sum of both best asks falls below the configured edge:
+
+```text
+combined = bestAskUp.price + bestAskDown.price
+fire if: combined < (1 - TARGET_EDGE)
+```
+
+With the default `TARGET_EDGE=0.02`, the bot fires when it can buy the combined position for less than **$0.98**. Each dollar of combined position locked in at $0.97 yields $0.03 profit at resolution regardless of outcome.
+
+Here is the exact logic from `_tryArb` in `src/trader.js`:
+
+```javascript src/trader.js
+async _tryArb(upTokenId, downTokenId) {
+  const upAsk   = this._bestAskUp;
+  const downAsk = this._bestAskDown;
+
+  if (!upAsk || !downAsk) return; // no book data yet
+
+  const combined = upAsk.price + downAsk.price;
+
+  // RULE 8: combined-ask circuit breaker
+  if (combined > COMBINED_ASK_STOP) {
+    this.log.warn('Trader: RULE-8 combined ask stop triggered', { combined });
+    this.halted = true;
+    return;
+  }
+
+  // RULE 3: fire if combined ask < (1 - TARGET_EDGE)
+  if (combined >= 1 - TARGET_EDGE) return;
+
+  // How many shares can we afford?
+  const remainingBudget = MAX_SPEND_PER_MARKET - this.totalSpent;
+  if (remainingBudget < 1) return; // RULE 9: cap exceeded
+
+  const maxShares = Math.min(
+    upAsk.size,
+    downAsk.size,
+    MAX_TAKER_FILL_USDC / combined,
+    remainingBudget    / combined,
+  );
+
+  if (maxShares < 1) return; // too small to be worth gas
+
+  // Fire both arb legs simultaneously.
+  // FOK (Fill-Or-Kill) ensures both legs either fill completely or cancel —
+  // avoiding a partial fill on one side that would create directional risk.
+  const upSpendUsdc = maxShares * upAsk.price;
+  const downSpendUsdc = maxShares * downAsk.price;
+  const [upRes, downRes] = await Promise.allSettled([
+    ClobClient.postFOKBuy(this.wallet, upTokenId,   upAsk.price,   upSpendUsdc),
+    ClobClient.postFOKBuy(this.wallet, downTokenId, downAsk.price, downSpendUsdc),
+  ]);
+  // ...
+}
+```
+
+FOK orders are critical here: if only one leg fills, the bot holds a directional position with no guaranteed hedge. FOK ensures both sides either fully fill or both cancel, keeping the inventory balanced.
+
+## Bot state machine phases
+
+The `Trader` class tracks its lifecycle through seven phases defined in the `PHASE` constant:
+
+| Phase | Description |
+|---|---|
+| `INIT` | Pre-open; waiting for the window timestamp |
+| `LIVE` | Window is open; ladder posted, arb loop running |
+| `CLOSING` | Last 15 seconds; no new buys, arb loop has exited |
+| `CANCELLED` | All open orders cancelled; final merge running |
+| `RESOLVING` | Waiting for oracle resolution via Gamma API poll |
+| `DONE` | Positions redeemed, net PnL logged |
+| `HALTED` | A circuit breaker fired; buying stopped early |
+
+A market that hits `HALTED` still proceeds through `CANCELLED` → `RESOLVING` → `DONE` — it just stops buying early. Existing positions are still merged and redeemed normally.

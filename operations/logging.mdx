@@ -1,0 +1,141 @@
+---
+title: "Logging and output monitoring"
+description: "How Polymarket Copy Trading Bot logs structured output to console and bot.log file using Winston, with log levels and what each log entry means."
+---
+
+The bot ships with a Winston-based logger that writes every significant event to two destinations simultaneously: a colorized, human-readable stream on the console for live monitoring, and a rotating JSON file (`bot.log`) for post-session analysis. Every module imports this logger directly, so all log output — startup events, order placement, on-chain transactions, circuit breaker triggers, and copy trade signals — flows through a single structured pipeline.
+
+## Log level
+
+Set the `LOG_LEVEL` environment variable to control verbosity. The default is `info`.
+
+| Value   | What you see                                                          |
+| ------- | --------------------------------------------------------------------- |
+| `error` | Fatal errors and unrecoverable failures only                          |
+| `warn`  | Errors plus degraded-state warnings (failed legs, balance sync issues) |
+| `info`  | Normal operational events — the recommended level for live sessions   |
+| `debug` | Full diagnostic output including waits, balance syncs, and skip reasons |
+
+```bash
+LOG_LEVEL=debug npm start
+```
+
+## What gets logged
+
+The table below maps each log message to the module that emits it and the level at which it appears.
+
+| Event | Level | Source |
+| ----- | ----- | ------ |
+| Bot startup with wallet address | `info` | `index.js` |
+| On-chain approvals confirmed | `info` | `onchain.js` |
+| CLOB credential initialisation | `info` | `clob.js` |
+| Price gate result at startup | `info` / `error` | `index.js` |
+| Market discovery with `opensIn` countdown | `info` | `index.js` |
+| Waiting before market fetch | `debug` | `index.js` |
+| Trader starting with token IDs and window times | `info` | `trader.js` |
+| Ladder posted (number of levels) | `info` | `trader.js` |
+| Approaching window close, stopping buys | `info` | `trader.js` |
+| Arb triggered with `upPrice`, `downPrice`, `combined`, `edge`, `shares` | `info` | `trader.js` |
+| Arb leg partially failed with side statuses | `warn` | `trader.js` |
+| Merge starting with pair count | `info` | `trader.js` |
+| Merge completed with `tx` hash and running total | `info` | `trader.js` |
+| Merge failed with error message | `error` | `trader.js` |
+| Redeem initiated with `upHeld` / `downHeld` balances | `info` | `trader.js` |
+| Redeem completed (estimated payout recorded in PnL) | `info` | `trader.js` |
+| Redeem failed with error message | `error` | `trader.js` |
+| Market complete with `totalSpent`, `mergedUsdc`, `redeemedUsdc`, `netPnl` | `info` | `trader.js` |
+| Circuit breaker: combined-ask stop | `warn` | `trader.js` |
+| Circuit breaker: inventory imbalance | `warn` | `trader.js` |
+| Circuit breaker: per-market spend cap reached | `info` | `trader.js` |
+| Session circuit breaker: hourly loss exceeded | `error` | `index.js` |
+| Copy trade signal: copying BUY with latency metrics | `info` | `copy/copyTrader.js` |
+| Copy trade order sent with `orderLatencyMs`, `signalLatencyMs` | `info` | `copy/copyTrader.js` |
+| Copy trade skipped with reason | `debug` | `copy/copyTrader.js` |
+| Copy trade order failed | `warn` | `copy/copyTrader.js` |
+| SIGINT / SIGTERM received | `info` | `index.js` |
+| Forced exit after grace period | `warn` | `index.js` |
+
+## Reading the log format
+
+The logger is defined in `src/logger.js`. Console output is formatted with color and a compact timestamp. File output is newline-delimited JSON with a full ISO 8601 timestamp.
+
+<Tabs>
+  <Tab title="Console output">
+    The console format is defined by the custom `printf` formatter in `src/logger.js`:
+
+    ```
+    HH:mm:ss.SSS level [market]: message { ...meta }
+    ```
+
+    The `[market]` segment appears only when a `marketLogger(slug)` child logger is active — that is, inside the `Trader` class during a live market. Top-level messages from `index.js` omit it.
+
+    Example lines from a live arb session:
+
+    ```text
+    14:32:01.003 info: Bot starting up… { wallet: '0xabc...def' }
+    14:32:01.412 info: Bot startup complete
+    14:32:01.680 info: Main: discovering next market { slug: 'btc-updown-5m-1714041000', opensIn: '47s' }
+    14:32:48.001 info [btc-updown-5m-1714041000]: Trader: posting ladder { levels: 23 }
+    14:32:48.390 info [btc-updown-5m-1714041000]: Trader: ladder posted
+    14:33:05.210 info [btc-updown-5m-1714041000]: Trader: RULE-3 arb triggered { upPrice: 0.49, downPrice: 0.49, combined: '0.9800', edge: '0.0200', shares: '51.02' }
+    14:33:05.880 info [btc-updown-5m-1714041000]: Trader: RULE-4 merging pairs { pairs: '51.0200' }
+    14:33:07.104 info [btc-updown-5m-1714041000]: Trader: merge done { pairs: '51.0200', mergedTotal: '51.0200', tx: '0xf1c2...' }
+    ```
+  </Tab>
+  <Tab title="bot.log (JSON)">
+    The file transport writes one JSON object per line. The logger rotates `bot.log` at 10 MB and keeps up to five files, so the active file is always named `bot.log`.
+
+    Example JSON entries:
+
+    ```json
+    {"level":"info","message":"Bot starting up…","timestamp":"2024-04-25T14:32:01.003Z","wallet":"0xabc...def"}
+    {"level":"info","message":"Trader: RULE-3 arb triggered","timestamp":"2024-04-25T14:33:05.210Z","market":"btc-updown-5m-1714041000","upPrice":0.49,"downPrice":0.49,"combined":"0.9800","edge":"0.0200","shares":"51.02"}
+    {"level":"info","message":"Trader: merge done","timestamp":"2024-04-25T14:33:07.104Z","market":"btc-updown-5m-1714041000","pairs":"51.0200","mergedTotal":"51.0200","tx":"0xf1c2..."}
+    {"level":"info","message":"Trader: market complete","timestamp":"2024-04-25T14:38:01.000Z","market":"btc-updown-5m-1714041000","totalSpent":"99.9600","mergedUsdc":"51.0200","redeemedUsdc":"51.0000","netPnl":"2.0600"}
+    ```
+
+    The `market` field is present on every entry emitted by the `Trader` class because it uses a `logger.child({ market: slug })` instance. Top-level messages from `index.js` do not carry the `market` field.
+  </Tab>
+</Tabs>
+
+## Structured log fields
+
+The following fields appear across log entries. All fields beyond `level`, `message`, and `timestamp` are part of the meta object and are merged into the JSON root in the file log.
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `timestamp` | string | ISO 8601 in file log; `HH:mm:ss.SSS` on console |
+| `level` | string | `error`, `warn`, `info`, or `debug` |
+| `market` | string | Market slug, present on all `Trader` log lines |
+| `message` | string | Human-readable event description |
+| `wallet` | string | Signer address (startup only) |
+| `combined` | string | Combined best ask (arb events) |
+| `edge` | string | `1 - combined` at time of arb fire |
+| `shares` | string | Shares purchased per arb leg |
+| `tx` | string | Transaction hash for merge or redeem |
+| `pairs` | string | Number of complementary-token pairs merged |
+| `latencyMs` | number | Age of copy signal in milliseconds |
+| `orderLatencyMs` | number | Time from signal receipt to order submission |
+| `signalLatencyMs` | number | Time from original trade timestamp to order fire |
+| `reason` | string | Filter reject reason on skipped copy trades |
+| `err` | string | Error message on failure events |
+
+## Post-session analysis
+
+`bot.log` is machine-readable and works directly with tools like `jq`. To extract all arb triggers from a session:
+
+```bash
+jq 'select(.message == "Trader: RULE-3 arb triggered")' bot.log
+```
+
+To calculate total merged USDC across all markets:
+
+```bash
+jq 'select(.message == "Trader: merge done") | .mergedTotal | tonumber' bot.log | paste -sd+ | bc
+```
+
+To review all error events:
+
+```bash
+jq 'select(.level == "error")' bot.log
+```

@@ -1,0 +1,307 @@
+---
+title: "CLOB client: order posting and auth"
+description: "Reference for src/clob.js — Polymarket CLOB authentication, REST order posting, WebSocket BookFeed, L1-to-L2 credential derivation, and EIP-712 order signing."
+---
+
+`src/clob.js` wraps Polymarket's REST and WebSocket APIs into two exported classes — `ClobClient` for authentication and order management, and `BookFeed` for real-time order book updates. The REST base URL is `https://clob.polymarket.com`. The WebSocket subscription endpoint is `wss://ws-subscriptions-clob.polymarket.com/ws/`. All order signing follows the EIP-712 standard using the correct exchange contract for the market type.
+
+## Authentication
+
+### `ClobClient.init(wallet)`
+
+Initialises the client by deriving CLOB API credentials from the wallet's EOA private key using Polymarket's L1→L2 auth flow. You do not need to set `POLY_API_KEY`, `POLY_API_SECRET`, or `POLY_API_PASSPHRASE` in your `.env` before first run — credentials are derived automatically on startup.
+
+The derivation flow:
+
+1. Sign an EIP-712 `ClobAuth` message with your EOA wallet (domain `ClobAuthDomain`, version `1`, chain ID 137).
+2. `GET /auth/derive-api-key` with the signature in the request headers. If the wallet already has a key pair registered at nonce 0, this returns the existing credentials.
+3. If derivation fails, fall back to `POST /auth/api-key` to create a new key pair.
+4. Store the returned `{ apiKey, secret, passphrase }` in the static `ClobClient._creds` field for all subsequent requests.
+
+```javascript src/clob.js
+static async init(wallet, { apiKey, secret, passphrase } = {}) {
+  ClobClient._wallet = wallet;
+  ClobClient._signerAddress = wallet.address;
+  try {
+    ClobClient._creds = await ClobClient._deriveCredentials(wallet);
+    return;
+  } catch (err) {
+    if (apiKey && secret && passphrase) {
+      ClobClient._creds = { apiKey, secret, passphrase };
+      return;
+    }
+    throw err;
+  }
+}
+```
+
+If explicit credentials are supplied and derivation fails (for example, during a network hiccup), the client falls back to the provided values rather than throwing.
+
+### Credential refresh
+
+If any authenticated request returns HTTP 401 with an `invalid api key` error message, the client automatically calls `ClobClient.refreshCredentials()` and retries the request once. You do not need to handle this in application code.
+
+```javascript src/clob.js
+static async refreshCredentials() {
+  ClobClient._creds = await ClobClient._deriveCredentials(ClobClient._wallet);
+  return ClobClient._creds;
+}
+```
+
+### Signature types
+
+The `SIGNATURE_TYPE` config value is embedded in every signed order struct. Polymarket supports three types:
+
+| Value | Name | When to use |
+|---|---|---|
+| `0` | `EOA` | Standalone wallet — the EOA is both signer and funder |
+| `1` | `POLY_PROXY` | Magic Link / email login accounts |
+| `2` | `GNOSIS_SAFE` | Browser wallets (MetaMask, Rabby) with a proxy wallet — the default |
+
+Most accounts use a proxy wallet, so `SIGNATURE_TYPE` defaults to `2`. Set it to `0` only if your EOA directly holds the USDC and you have no proxy wallet.
+
+## EIP-712 order signing
+
+Every order the bot posts is signed off-chain as an EIP-712 typed-data message and submitted via REST. The exchange verifies the signature on-chain when the order fills.
+
+### Order struct fields
+
+```javascript src/config.js
+export const ORDER_TYPES = {
+  Order: [
+    { name: 'salt',          type: 'uint256' },
+    { name: 'maker',         type: 'address' },
+    { name: 'signer',        type: 'address' },
+    { name: 'taker',         type: 'address' },
+    { name: 'tokenId',       type: 'uint256' },
+    { name: 'makerAmount',   type: 'uint256' },
+    { name: 'takerAmount',   type: 'uint256' },
+    { name: 'expiration',    type: 'uint256' },
+    { name: 'nonce',         type: 'uint256' },
+    { name: 'feeRateBps',    type: 'uint256' },
+    { name: 'side',          type: 'uint8'   },
+    { name: 'signatureType', type: 'uint8'   },
+  ],
+};
+```
+
+`maker` is set to `PROXY_WALLET`. `signer` is the EOA (`wallet.address`). `salt` is a random integer to prevent replay. `expiration` of `0` means GTC (good-till-cancelled).
+
+### ORDER_DOMAIN vs ORDER_DOMAIN_BINARY
+
+Polymarket runs two separate exchange contracts. Orders must be signed against the correct one or they will be rejected on-chain.
+
+```javascript src/config.js
+// NegRisk CTF Exchange — for complementary-token (multi-outcome) markets
+export const ORDER_DOMAIN = {
+  name: 'Polymarket CTF Exchange',
+  version: '1',
+  chainId: 137,
+  verifyingContract: '0xC5d563A36AE78145C45a50134d48A1215220f80a',
+};
+
+// Standard CTF Exchange — for simple binary YES/NO markets
+export const ORDER_DOMAIN_BINARY = {
+  name: 'Polymarket CTF Exchange',
+  version: '1',
+  chainId: 137,
+  verifyingContract: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+};
+```
+
+The `negRisk` boolean passed to every order method selects which domain to use. NegRisk markets (such as `btc-updown-5m`) always use `ORDER_DOMAIN`. Standard binary markets use `ORDER_DOMAIN_BINARY`.
+
+## Static methods
+
+### `ClobClient.postLimitBuy(wallet, tokenId, price, shares, negRisk?)`
+
+Posts a GTC (good-till-cancelled) limit buy order. Fetches the current taker fee and tick size for `tokenId` before signing, so the order conforms to CLOB rounding rules. Returns the `orderId` string on success, or throws if the exchange rejects the order.
+
+```javascript
+const orderId = await ClobClient.postLimitBuy(wallet, tokenId, 0.45, 100);
+```
+
+- `price` — limit price in human units (0–1, e.g. `0.45`)
+- `shares` — number of shares in human units (e.g. `100`)
+- `negRisk` — defaults to `true`; set to `false` for standard binary markets
+
+### `ClobClient.postFOKBuy(wallet, tokenId, maxPrice, usdcAmount, negRisk?)`
+
+Posts a Fill-Or-Kill buy order. The entire order must fill immediately and completely or it is cancelled — no partial fills. Use this when both legs of an arb must fill equally to maintain a delta-neutral position.
+
+```javascript
+const res = await ClobClient.postFOKBuy(wallet, tokenId, 0.50, 100);
+```
+
+- `maxPrice` — maximum price the bot will pay (human units)
+- `usdcAmount` — total USDC to spend
+
+### `ClobClient.postIOCBuy(wallet, tokenId, maxPrice, amountUsdc, negRisk?)`
+
+Posts a FAK (Fill-And-Kill) buy order — the Polymarket equivalent of IOC. Fills as many shares as are immediately available at or below `maxPrice`, then cancels any unfilled remainder. Used in the copy-trading path where a partial fill is acceptable.
+
+```javascript
+const res = await ClobClient.postIOCBuy(wallet, tokenId, 0.52, 50);
+```
+
+- `maxPrice` — maximum price the bot will pay (human units, 0–1)
+- `amountUsdc` — total USDC to spend
+
+### `ClobClient.cancelOrder(orderId)`
+
+Cancels a single open order by its CLOB order ID string.
+
+```javascript
+await ClobClient.cancelOrder('ord_abc123...');
+```
+
+### `ClobClient.cancelMarket(conditionId)`
+
+Cancels all open orders for a specific market, identified by its `conditionId`. Called at market close or on graceful shutdown.
+
+```javascript
+await ClobClient.cancelMarket('0xabc...');
+```
+
+### `ClobClient.cancelAll()`
+
+Cancels every open order across all markets for this wallet. Called during `SIGINT` / `SIGTERM` handling.
+
+```javascript
+await ClobClient.cancelAll();
+```
+
+### `ClobClient.getOpenOrders(conditionId)`
+
+Returns all open orders for this wallet on a specific market, identified by `conditionId`. Each entry has `{ id, tokenId, price, size, side }`.
+
+```javascript
+const orders = await ClobClient.getOpenOrders('0xabc...');
+```
+
+### `ClobClient.getBook(tokenId)`
+
+Fetches the full order book for a token from the REST API without authentication. Returns bids, asks, tick size, and minimum order size.
+
+```javascript
+const { bids, asks, tickSize, minOrderSize } = await ClobClient.getBook(tokenId);
+```
+
+### `ClobClient.getBestAsk(tokenId)`
+
+Convenience wrapper around `getBook` that returns only the best (lowest-priced) ask, along with `tickSize` and `minOrderSize`.
+
+```javascript
+const { price, size, tickSize } = await ClobClient.getBestAsk(tokenId);
+```
+
+Returns `null` if the book has no asks.
+
+## BookFeed
+
+`BookFeed` is an `EventEmitter` that maintains a live best-ask for each subscribed token via the Polymarket market WebSocket channel. It reconnects automatically with exponential back-off (starting at 1 second, capped at 30 seconds) if the connection drops.
+
+### Constructor
+
+```javascript
+const feed = new BookFeed([tokenIdA, tokenIdB]);
+```
+
+Pass an array of ERC-1155 token ID strings to subscribe.
+
+### `start()` / `stop()`
+
+```javascript
+feed.start(); // opens the WebSocket connection
+feed.stop();  // closes and suppresses reconnect
+```
+
+### Events
+
+| Event | Payload | When emitted |
+|---|---|---|
+| `'snapshot'` | `{ tokenId, bids, asks }` | Full order book received on initial connect |
+| `'update'` | `{ tokenId, bestAsk: { price, size } }` | Best ask changes (from `price_change` or `best_bid_ask` message) |
+| `'trade'` | `{ tokenId, price, size }` | A trade is matched on the book |
+| `'error'` | `err` | WebSocket error |
+| `'close'` | — | Feed stopped by calling `stop()` |
+
+The `'update'` event is the primary signal used by the arbitrage engine to detect when the combined ask on a market falls below the target edge.
+
+### WebSocket message types
+
+The feed handles three message types from the server:
+
+- **`book`** — full snapshot delivered on subscribe; seeds `bestAsks` and emits `'snapshot'`
+- **`price_change`** — incremental diff of ask levels; updates `bestAsks` and emits `'update'`
+- **`best_bid_ask`** — fast top-of-book update (requires `custom_feature_enabled: true` in the subscription message); emits `'update'` directly without parsing the full diff
+
+When a `price_change` message removes the current best ask level (size becomes 0), `BookFeed` falls back to a REST call via `ClobClient.getBestAsk` to find the new best ask rather than guessing from the diff.
+
+### REST fallback
+
+If the WebSocket is unavailable, the bot also supports polling the REST book endpoint on a `BOOK_POLL_MS` interval (default `1500` ms, configured in `src/config.js`). The `BookFeed._refreshBestAsk` method is used for this fallback internally.
+
+```javascript src/clob.js
+async _refreshBestAsk(tokenId) {
+  try {
+    const best = await ClobClient.getBestAsk(tokenId);
+    if (best) {
+      this.bestAsks[tokenId] = best;
+      this.emit('update', { tokenId, bestAsk: best });
+    }
+  } catch (e) {
+    logger.warn('BookFeed: refresh best ask failed', { tokenId, err: e.message });
+  }
+}
+```
+
+## FillFeed
+
+`FillFeed` is a second `EventEmitter` class exported from `src/clob.js` that subscribes to user-level fill events on Polymarket's authenticated WebSocket channel (`wss://ws-subscriptions-clob.polymarket.com/ws/user`). Unlike `BookFeed`, which tracks the public order book, `FillFeed` receives private fill notifications scoped to your own wallet's orders.
+
+### Constructor and lifecycle
+
+```javascript
+const fills = new FillFeed();
+fills.start();  // opens the user WebSocket and authenticates
+fills.stop();   // closes and suppresses reconnect
+```
+
+`FillFeed` reads credentials from `ClobClient.creds` at `start()` time. `ClobClient.init()` must have been called first.
+
+### `'fill'` event
+
+Emitted whenever one of your orders is matched:
+
+| Field | Type | Description |
+|---|---|---|
+| `tokenId` | `string` | The ERC-1155 token ID that was filled. |
+| `price` | `number` | Fill price. |
+| `size` | `number` | Number of shares filled. |
+| `side` | `string` | `'BUY'` or `'SELL'`. |
+| `orderId` | `string` | The CLOB order ID that was matched. |
+| `matchedAt` | `string` | Timestamp from the fill event. |
+
+```javascript
+fills.on('fill', ({ tokenId, price, size, orderId }) => {
+  console.log(`Filled ${size} shares of ${tokenId} at ${price}`);
+});
+```
+
+`FillFeed` reconnects automatically every 2 seconds if the WebSocket closes unexpectedly.
+
+## HMAC request signing
+
+Every authenticated REST call includes HMAC-SHA256 headers. The signature covers the timestamp, HTTP method, path, and request body, using the base64-decoded `POLY_API_SECRET` as the HMAC key. The output is encoded as URL-safe base64.
+
+Required headers on authenticated requests:
+
+| Header | Value |
+|---|---|
+| `POLY_ADDRESS` | EOA signer address (not the proxy wallet) |
+| `POLY_SIGNATURE` | HMAC-SHA256 of `timestamp + METHOD + path + body` |
+| `POLY_TIMESTAMP` | Unix timestamp in seconds |
+| `POLY_NONCE` | `"0"` |
+| `POLY_API_KEY` | API key UUID |
+| `POLY_PASSPHRASE` | API passphrase |

@@ -1,0 +1,79 @@
+---
+title: "Configuration overview for the trading bot"
+description: "All environment variables for Polymarket Copy Trading Bot, covering wallet credentials, trading mode, CLOB auth, RPC, and risk parameters."
+---
+
+All bot configuration is managed through a single `.env` file in the project root. No settings are hard-coded outside of `src/config.js`, so every parameter you need to change is in one place. Copy the provided example file to get started:
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` in your editor and fill in at minimum `PRIVATE_KEY` and `PROXY_WALLET`. All other variables have safe defaults, but you should review every value before running the bot with real funds.
+
+## Trading mode
+
+The `TRADING_MODE` variable controls which strategy `npm start` launches. Set it once and the bot will ignore all settings that belong to the other mode.
+
+<ParamField path="TRADING_MODE" type="string" default="arb">
+  Selects the active strategy. Use `arb` for the 9-rule BTC Up/Down arbitrage
+  strategy, or `copy` for the BUY-only copy trader. Any other value will cause
+  the bot to exit on startup with an error.
+</ParamField>
+
+## Wallet settings
+
+These three variables identify your on-chain identity and must be set before the bot can sign or submit any orders.
+
+<ParamField path="PRIVATE_KEY" type="string" required>
+  The private key of your Polygon EOA — the account that controls your
+  Polymarket proxy wallet. Must be a 0x-prefixed 32-byte hex string. Keep this
+  value secret and never commit it to version control.
+</ParamField>
+
+<ParamField path="PROXY_WALLET" type="string" required>
+  The Polymarket proxy wallet address associated with your account. Retrieve it
+  from [polymarket.com](https://polymarket.com) after connecting your wallet.
+  Must be EIP-55 checksummed or lowercase — the bot preserves whatever casing
+  you supply.
+</ParamField>
+
+<ParamField path="POLYGON_RPC" type="string" default="https://polygon-rpc.com">
+  The JSON-RPC endpoint used for on-chain calls (approvals, contract reads,
+  USDC transfers). The public fallback works but is rate-limited. For
+  production use a private endpoint from Alchemy, Infura, or QuickNode.
+</ParamField>
+
+## CLOB API credentials
+
+Polymarket's Central Limit Order Book API requires a derived API key tied to your wallet. You do **not** need to create these manually — leave all three fields blank on first run and `ClobClient.init()` will derive valid credentials automatically from your signer using Polymarket's L1→L2 auth flow.
+
+<ParamField path="POLY_API_KEY" type="string">
+  L2 API key derived from your wallet signature. Leave blank on first run; the
+  bot derives credentials automatically via the L1→L2 auth flow in `src/clob.js`.
+</ParamField>
+
+<ParamField path="POLY_API_SECRET" type="string">
+  HMAC secret paired with `POLY_API_KEY`. Auto-derived alongside the key.
+  Treat this value with the same care as `PRIVATE_KEY`.
+</ParamField>
+
+<ParamField path="POLY_API_PASSPHRASE" type="string">
+  Passphrase component of the L2 credential set. Auto-derived alongside the
+  key and secret.
+</ParamField>
+
+## Mode-specific parameters
+
+The remaining environment variables control risk limits, ladder shape, and copy-trading behaviour. They are documented in full on the pages below.
+
+<CardGroup cols={2}>
+  <Card title="Arbitrage settings" icon="chart-line" href="/configuration/arbitrage-settings">
+    Ladder levels, edge targets, taker caps, circuit breakers, and all other
+    arb-mode parameters.
+  </Card>
+  <Card title="Copy trading settings" icon="copy" href="/configuration/copy-trading-settings">
+    Target wallets, sizing mode, spend caps, price filters, and dry-run mode
+    for the copy trader.
+  </Card>
+</CardGroup>

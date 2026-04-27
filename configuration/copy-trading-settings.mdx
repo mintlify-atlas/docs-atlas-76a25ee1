@@ -1,0 +1,164 @@
+---
+title: "Copy trading configuration and spend controls"
+description: "Complete reference for all copy-trading environment variables: targets, sizing mode, spend caps, price filters, and dry-run mode."
+---
+
+The copy trader supports two independent paths. The first is a lightweight watcher built into the arbitrage bot: when `TARGET_WALLET` is set, the arb bot will also mirror that wallet's buys as a side effect of its main loop. The second is the dedicated copy trader launched by `npm run copy` (or by setting `TRADING_MODE=copy`), which is fully configurable, supports multiple targets, and enforces its own set of spend and safety limits. Most users should use the dedicated copy trader; the integrated watcher exists primarily for simple single-wallet mirroring alongside an arb session.
+
+<Tip>
+  Set `COPY_DRY_RUN=true` for your first run. The bot will log every trade it
+  would have placed — including the sizing calculation and all guard-rail checks
+  — without sending a single real order. This is the fastest way to verify your
+  configuration before committing capital.
+</Tip>
+
+## Integrated copy watcher (arb bot)
+
+These variables are read by the main arb bot (`src/config.js`) and activate copy-trading as a secondary behaviour alongside the arbitrage strategy.
+
+<ParamField path="TARGET_WALLET" type="string" default="">
+  A single Polymarket proxy wallet address to mirror. When set, the arb bot
+  will attempt to replicate BUY trades observed from this address. Leave blank
+  to disable the integrated watcher. Use the dedicated copy trader
+  (`COPY_TARGETS`) if you need to track multiple wallets or require granular
+  spend controls.
+</ParamField>
+
+<ParamField path="COPY_TRADE_BUY_PERCENT" type="number" default="100">
+  Scales the mirrored trade size as a percentage of the target's spend. `100`
+  copies the exact USDC amount; `50` copies half. Only applies to the
+  integrated watcher — the dedicated copy trader uses `COPY_SIZE_MODE` instead.
+</ParamField>
+
+<ParamField path="COPY_TRADE_POLL_MS" type="number" default="2000">
+  How often the integrated watcher polls for new trades from `TARGET_WALLET`,
+  in milliseconds. The dedicated copy trader has its own `COPY_POLL_MS`
+  setting below.
+</ParamField>
+
+## Dedicated copy trader
+
+The variables in this section are read exclusively by `src/copy/config.js` and control the standalone copy trading process.
+
+### Target wallets
+
+<ParamField path="COPY_TARGETS" type="string" required>
+  Comma-separated list of Polymarket proxy wallet addresses to mirror. All
+  addresses are normalised to lowercase internally. At least one address is
+  required — the bot will exit on startup if this variable is missing or empty.
+
+  ```
+  COPY_TARGETS=0xabc...123,0xdef...456
+  ```
+</ParamField>
+
+### Sizing mode
+
+<ParamField path="COPY_SIZE_MODE" type="string" default="FIXED">
+  Controls how the bot calculates the USDC amount to spend on each copied
+  trade. Accepted values:
+
+  | Value | Behaviour |
+  |---|---|
+  | `FIXED` | Always spend exactly `COPY_FIXED_USDC` per trade, regardless of what the target spent. |
+  | `MIRROR` | Spend the same USDC amount the target spent, capped by `COPY_MAX_USDC_PER_TRADE`. |
+  | `RATIO` | Spend `COPY_RATIO × target_spend`, capped by `COPY_MAX_USDC_PER_TRADE`. |
+</ParamField>
+
+<ParamField path="COPY_FIXED_USDC" type="number" default="10">
+  Trade size in USDC when `COPY_SIZE_MODE=FIXED`. Ignored for `MIRROR` and
+  `RATIO` modes.
+</ParamField>
+
+<ParamField path="COPY_RATIO" type="number" default="0.10">
+  Multiplier applied to the target's spend when `COPY_SIZE_MODE=RATIO`. A
+  value of `0.10` copies 10% of each trade. The result is still capped by
+  `COPY_MAX_USDC_PER_TRADE`.
+</ParamField>
+
+### Spend caps
+
+All caps are enforced cumulatively and independently — a trade is only placed if it passes every applicable check.
+
+<ParamField path="COPY_MAX_USDC_PER_TRADE" type="number" default="50">
+  Hard ceiling on any single copied order, in USDC. Applies to all sizing
+  modes and acts as a last-resort guard against unexpectedly large target
+  trades in `MIRROR` or `RATIO` mode.
+</ParamField>
+
+<ParamField path="COPY_MAX_USDC_PER_MARKET" type="number" default="200">
+  Maximum cumulative USDC the bot will spend on a single market condition
+  across all copied trades. Once this limit is reached the condition is
+  silently skipped until the process restarts.
+</ParamField>
+
+<ParamField path="COPY_MAX_USDC_PER_HOUR" type="number" default="500">
+  Maximum USDC spent across all markets in any rolling 60-minute window. When
+  the hourly budget is exhausted the bot pauses all new orders until spend
+  rolls off the window.
+</ParamField>
+
+<ParamField path="COPY_MAX_USDC_TOTAL" type="number" default="2000">
+  Lifetime USDC spend cap for the current process run. Once this limit is hit
+  the bot exits cleanly. Reset by restarting the process.
+</ParamField>
+
+### Price filters
+
+<ParamField path="COPY_MAX_SLIPPAGE" type="number" default="0.03">
+  Maximum tolerated slippage between the target's fill price and the current
+  best ask at execution time, expressed as a fraction of the price (not
+  percentage). A value of `0.03` allows up to 3 cents of adverse movement.
+  Trades that would require paying more than this are skipped.
+</ParamField>
+
+<ParamField path="COPY_MAX_PRICE" type="number" default="0.97">
+  Do not copy trades where the token price is at or above this value. Buying a
+  position at $0.97+ leaves very little upside and is usually a sign the
+  target is averaging into a near-resolved market.
+</ParamField>
+
+<ParamField path="COPY_MIN_PRICE" type="number" default="0.02">
+  Do not copy trades where the token price is at or below this value. Prices
+  this low are typically illiquid tail positions or dust.
+</ParamField>
+
+### Staleness and polling
+
+<ParamField path="COPY_STALE_MS" type="number" default="8000">
+  Discard any detected trade that is older than this value (in milliseconds)
+  at the moment of detection. Prevents the bot from chasing signals that have
+  already been priced in. 8 000 ms (8 seconds) is enough to cover one Polygon
+  block confirmation plus API latency under normal conditions.
+</ParamField>
+
+<ParamField path="COPY_POLL_MS" type="number" default="250">
+  How often the bot polls the Polymarket data API for new trades from each
+  target wallet, in milliseconds. At the default of 250 ms the bot makes
+  approximately 4 requests per second per target wallet. Increase this value
+  if you are tracking many wallets and approaching API rate limits.
+</ParamField>
+
+### Allow and block lists
+
+<ParamField path="COPY_ALLOWED_CONDITIONS" type="string" default="">
+  Comma-separated list of 0x-prefixed condition IDs the bot is permitted to
+  copy. When this list is non-empty the bot ignores every market not explicitly
+  listed. Leave blank to copy any market the target trades.
+</ParamField>
+
+<ParamField path="COPY_BLOCKED_CONDITIONS" type="string" default="">
+  Comma-separated list of 0x-prefixed condition IDs that are always skipped,
+  even if `COPY_ALLOWED_CONDITIONS` is empty. Use this to exclude specific
+  markets you do not want exposure to regardless of what the target trades.
+</ParamField>
+
+### Dry-run mode
+
+<ParamField path="COPY_DRY_RUN" type="boolean" default="false">
+  When set to `true`, the bot runs its full detection and sizing pipeline and
+  logs every trade it would execute, but does not submit any orders to the
+  CLOB. Useful for auditing configuration, validating that targets are being
+  tracked correctly, and estimating spend rates before going live. Accepted
+  truthy values: `true`, `1`, `yes`, `on` (case-insensitive).
+</ParamField>

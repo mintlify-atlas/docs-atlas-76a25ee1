@@ -1,0 +1,271 @@
+---
+title: "Copy engine: ActivityFeed and CopyTrader"
+description: "Reference for ActivityFeed and CopyTrader classes in src/copy/ — trade polling, event dedup, filter pipeline, sizing modes, and spend accounting."
+---
+
+The dedicated copy-trading engine lives entirely under `src/copy/` and is independent of the arbitrage runtime. It consists of two classes: `ActivityFeed`, which polls Polymarket's public trade data to detect fresh fills from target wallets, and `CopyTrader`, which filters those signals, sizes the corresponding orders, and fires IOC buys against the CLOB. Both are `EventEmitter` subclasses and can be composed in any Node.js process — the `src/copy/index.js` entrypoint wires them together for the `TRADING_MODE=copy` path.
+
+---
+
+## ActivityFeed
+
+`ActivityFeed` (`src/copy/activityFeed.js`) is a high-frequency poller that watches one or more Polymarket proxy wallet addresses and emits a `'trade'` event for every new BUY fill it detects.
+
+### Why polling instead of WebSocket
+
+Polymarket's user WebSocket is scoped to your own API credentials, so you cannot receive another wallet's fill events there. The market-level WebSocket publishes public `trade` events but omits the maker wallet address, which makes filtering by target impossible. The lowest-latency public source of a specific wallet's fills is `GET /trades?user=<addr>` on the Data API. Keep-alive HTTP agents are used to minimise per-request TLS overhead.
+
+### Constructor
+
+```javascript
+new ActivityFeed(targets, pollMs)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `targets` | `string[]` | Lowercase Polymarket proxy-wallet addresses to watch. |
+| `pollMs` | `number` | Polling interval per target in milliseconds. Default (from config) is 250 ms — approximately 4 requests per second per target. |
+
+### `start()` and `stop()`
+
+```javascript
+feed.start()  // begins polling all targets immediately
+feed.stop()   // clears all timers; no further events are emitted
+```
+
+`start()` schedules the first tick for every target with a 0 ms delay. `stop()` clears all pending timers and sets an internal `_stopped` flag so in-flight callbacks return without rescheduling.
+
+### How polling works
+
+Each target gets its own independent timer loop. The flow for a single tick is:
+
+1. If `_inFlight.get(target)` is `true`, the previous request is still outstanding — skip this tick and reschedule for the next `pollMs`.
+2. Set `_inFlight` to `true`, record the start time.
+3. `GET /trades?user=<target>&limit=25&takerOnly=false` with a 4-second request timeout.
+4. Call `_process(target, trades)`.
+5. Set `_inFlight` to `false`. Schedule the next tick at `max(50, pollMs - elapsed)` to account for request latency while maintaining a minimum 50 ms floor.
+
+```javascript
+async _tick(target) {
+  if (this._inFlight.get(target)) {
+    this._schedule(target, this.pollMs);
+    return;
+  }
+  this._inFlight.set(target, true);
+  // ...
+  const next = Math.max(50, this.pollMs - elapsed);
+  this._schedule(target, next);
+}
+```
+
+A limit of 25 results is enough because at 250 ms poll intervals a target would need to execute more than 100 trades per second to overflow the window.
+
+### FifoSet dedup
+
+Trade deduplication uses a bounded FIFO set (`FifoSet`) capped at `COPY_DEDUP_CACHE` entries (default 5,000). The dedup key is:
+
+```
+primaryKey   = transactionHash.toLowerCase() + ':' + assetId
+fallbackKey  = timestamp + ':' + assetId + ':' + size + ':' + price
+```
+
+The primary key is preferred because `transactionHash + asset` is guaranteed unique per fill leg. The fallback is used only when the API response omits the transaction hash.
+
+### Startup warmup
+
+On the very first poll for each target, `_process` marks all returned trades as seen **without emitting** them. This prevents the bot from firing a burst of copy orders for fills that happened before startup. After the first poll, the target is added to `_warmedUp` and subsequent new fills are emitted normally.
+
+```javascript
+const firstPoll = !this._warmedUp.has(target);
+// ... process ordered trades
+if (firstPoll) continue; // don't emit startup backlog
+this.emit('trade', norm);
+if (firstPoll) this._warmedUp.add(target);
+```
+
+### `'trade'` event shape
+
+Every emitted `'trade'` event is a normalised object with the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | `string` | The wallet address being copied (lowercase). |
+| `tokenId` | `string` | ERC-1155 position token ID of the asset that was bought. |
+| `conditionId` | `string` | `0x`-prefixed bytes32 condition ID (lowercase). |
+| `side` | `string` | Always `'BUY'` — sells are filtered out before emission. |
+| `price` | `number` | Fill price as a float between 0 and 1. |
+| `size` | `number` | Number of shares the target bought. |
+| `usdc` | `number` | Target's USDC spend (`price × size`). |
+| `timestamp` | `number` | Fill time in Unix seconds. |
+| `ageMs` | `number` | Milliseconds between the fill time and the moment this event is emitted. Used by `CopyTrader` for staleness filtering. |
+| `txHash` | `string` | Polygon transaction hash (lowercase). |
+| `slug` | `string \| null` | Market event slug if present in the API response. |
+| `question` | `string \| null` | Market question string if present. |
+| `outcome` | `string \| null` | Outcome label (`'Up'`, `'Down'`, etc.) if present. |
+
+---
+
+## CopyTrader
+
+`CopyTrader` (`src/copy/copyTrader.js`) consumes `ActivityFeed` trade events and executes the copy. On every `'trade'` event it runs a zero-I/O filter pipeline, computes the order size, and fires a single IOC buy. No REST or WebSocket calls happen in the hot path beyond the one order POST.
+
+### Constructor
+
+```javascript
+new CopyTrader(wallet)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `wallet` | `ethers.Wallet` | Signer used to authenticate and sign CLOB orders. |
+
+### `onTrade(ev)` — the main handler
+
+Wire `ActivityFeed` to `CopyTrader` by passing events to `onTrade`:
+
+```javascript
+feed.on('trade', ev => copyTrader.onTrade(ev));
+```
+
+`onTrade` is `async` and follows this sequence:
+
+1. Call `_rejectReason(ev)`. If non-null, increment `skipCount` and return.
+2. Call `_ourUsdc(ev)` to compute the order size in USDC. If the result is `< 1`, skip.
+3. Compute `maxPrice = Math.min(COPY_MAX_PRICE, ev.price + COPY_MAX_SLIPPAGE)`.
+4. Compute `shares = Math.floor(ourUsdc / maxPrice)` — guarantees USDC spend never exceeds `ourUsdc`.
+5. If `COPY_DRY_RUN` is set, emit `'copy'` with `dryRun: true` and return without placing an order.
+6. Call `ClobClient.postIOCBuy(wallet, ev.tokenId, maxPrice, shares)`.
+7. Record spend via `_recordSpend(ev.conditionId, shares × maxPrice)`, increment `copyCount`, and emit `'copy'`.
+8. On error, increment `failCount` and emit `'copy-failed'`.
+
+### Filter pipeline: `_rejectReason(ev)`
+
+Returns a string describing why the trade should be skipped, or `null` if it passes all filters. Checks are evaluated in order; the first match short-circuits.
+
+| Check | Rejection reason |
+|---|---|
+| `ev.side !== 'BUY'` | `'not-a-buy'` |
+| `ev.ageMs > COPY_STALE_MS` | `'stale(<ms>)'` |
+| `ev.price < COPY_MIN_PRICE` | `'price-too-low(<price>)'` |
+| `ev.price > COPY_MAX_PRICE` | `'price-too-high(<price>)'` |
+| `conditionId` in `COPY_BLOCKED_CONDITIONS` | `'blocked-condition'` |
+| `COPY_ALLOWED_CONDITIONS` non-empty and `conditionId` not in it | `'not-in-allow-list'` |
+| `totalSpent >= COPY_MAX_USDC_TOTAL` | `'total-cap'` |
+| Per-market spend `>= COPY_MAX_USDC_PER_MARKET` | `'per-market-cap'` |
+| Rolling hourly spend `>= COPY_MAX_USDC_PER_HOUR` | `'hourly-cap'` |
+
+```javascript
+_rejectReason(ev) {
+  if (ev.side !== 'BUY')                          return 'not-a-buy';
+  if (ev.ageMs > COPY_STALE_MS)                   return `stale(${ev.ageMs}ms)`;
+  if (ev.price < COPY_MIN_PRICE)                  return `price-too-low(${ev.price})`;
+  if (ev.price > COPY_MAX_PRICE)                  return `price-too-high(${ev.price})`;
+
+  const cid = (ev.conditionId || '').toLowerCase();
+  if (COPY_BLOCKED_CONDITIONS.has(cid))           return 'blocked-condition';
+  if (COPY_ALLOWED_CONDITIONS.size > 0 && !COPY_ALLOWED_CONDITIONS.has(cid)) {
+    return 'not-in-allow-list';
+  }
+
+  if (this.totalSpent >= COPY_MAX_USDC_TOTAL)     return 'total-cap';
+  if ((this.spentByMarket.get(cid) ?? 0) >= COPY_MAX_USDC_PER_MARKET) {
+    return 'per-market-cap';
+  }
+  if (this._rollingHourSpent() >= COPY_MAX_USDC_PER_HOUR) return 'hourly-cap';
+
+  return null;
+}
+```
+
+### Sizing: `_ourUsdc(ev)`
+
+Computes the raw USDC size from the configured `COPY_SIZE_MODE`, then applies all caps and returns the smallest value.
+
+| Mode | Formula |
+|---|---|
+| `FIXED` | `COPY_FIXED_USDC` (default) |
+| `MIRROR` | `ev.usdc` — exact copy of target's spend |
+| `RATIO` | `ev.usdc × COPY_RATIO` |
+
+After the raw size is computed, it is reduced to the minimum of:
+
+- `COPY_MAX_USDC_PER_TRADE`
+- Remaining per-market budget (`COPY_MAX_USDC_PER_MARKET - spentByMarket`)
+- Remaining hourly budget (`COPY_MAX_USDC_PER_HOUR - rollingHourSpent`)
+- Remaining total budget (`COPY_MAX_USDC_TOTAL - totalSpent`)
+
+```javascript
+_ourUsdc(ev) {
+  let raw;
+  switch (COPY_SIZE_MODE) {
+    case 'MIRROR': raw = ev.usdc;              break;
+    case 'RATIO':  raw = ev.usdc * COPY_RATIO; break;
+    case 'FIXED':
+    default:       raw = COPY_FIXED_USDC;      break;
+  }
+  return Math.max(0, Math.min(
+    raw,
+    COPY_MAX_USDC_PER_TRADE,
+    remainingPerMarket,
+    remainingHourly,
+    remainingTotal,
+  ));
+}
+```
+
+### Order placement
+
+```javascript
+ClobClient.postIOCBuy(this.wallet, ev.tokenId, maxPrice, shares)
+```
+
+`maxPrice` is capped at `COPY_MAX_PRICE` and set to `ev.price + COPY_MAX_SLIPPAGE`. The `shares` count is `Math.floor(ourUsdc / maxPrice)`, ensuring the total USDC committed never exceeds `ourUsdc` regardless of fill price.
+
+Spend is recorded conservatively as `shares × maxPrice` on every order submission. If the order partially fills or is rejected, the cap accounting still consumes the full amount — this is intentional to prevent cap-bypass scenarios.
+
+### Spend tracking
+
+| Property | Type | Description |
+|---|---|---|
+| `totalSpent` | `number` | Cumulative USDC committed since construction. |
+| `spentByMarket` | `Map<string, number>` | Per-condition-ID spend. Used by the per-market cap check. |
+| `hourlySpends` | `Array<{ts, usdc}>` | Timestamped spend records. Pruned in-place when `_rollingHourSpent()` is called. |
+
+The rolling hourly spend is computed by discarding entries older than 60 minutes from the front of `hourlySpends`:
+
+```javascript
+_rollingHourSpent() {
+  const cutoff = Date.now() - HOUR_MS;
+  while (this.hourlySpends.length && this.hourlySpends[0].ts < cutoff) {
+    this.hourlySpends.shift();
+  }
+  return this.hourlySpends.reduce((a, b) => a + b.usdc, 0);
+}
+```
+
+### `stats()` method
+
+Returns a plain object suitable for logging or health-check endpoints:
+
+```javascript
+copyTrader.stats()
+// {
+//   copies:          number,   // successful copy orders placed
+//   skips:           number,   // trades rejected by filter pipeline
+//   failures:        number,   // order POST errors
+//   totalSpent:      string,   // USDC (toFixed(2))
+//   rollingHourUsdc: string,   // rolling 60-min spend (toFixed(2))
+//   markets:         number,   // distinct conditionIds with spend > 0
+// }
+```
+
+### Events emitted
+
+| Event | Payload | Description |
+|---|---|---|
+| `'copy'` | `{ ev, ourUsdc, shares, maxPrice, res, dryRun? }` | Fired after a successful order POST (or in dry-run mode). `res` is the CLOB API response; `dryRun: true` is set when `COPY_DRY_RUN` is enabled. |
+| `'copy-failed'` | `{ ev, err }` | Fired when the order POST throws. `err` is the caught error object. |
+
+<Note>
+  Always start with `COPY_DRY_RUN=true`. In dry-run mode `onTrade` runs the full filter and sizing pipeline and emits `'copy'` events, but no actual orders are sent to the CLOB. This lets you validate your configuration and observe which trades pass the filter before committing real USDC.
+</Note>

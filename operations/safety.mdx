@@ -1,0 +1,133 @@
+---
+title: "Safety guidelines and responsible use"
+description: "Best practices and safety requirements for operating Polymarket Copy Trading Bot responsibly, including wallet hygiene, sizing, dry-run testing, and disclaimer."
+---
+
+The bot places live blockchain transactions and CLOB orders on Polygon using real funds. Before running it against a funded wallet, spend time reviewing the `.env.example` comments, starting with small sizing, and verifying every configuration value. The guidelines below describe the minimum precautions for a responsible first run and ongoing operation.
+
+## Dedicated wallet
+
+Run the bot with a wallet used exclusively for this purpose. Never use a wallet that holds funds you cannot afford to lose or that is shared with other applications.
+
+The private key in `PRIVATE_KEY` has full signing authority over your signer account, including the ability to approve token transfers and broadcast transactions. If this key is compromised or misconfigured, all funds accessible by that signer are at risk.
+
+<Warning>
+  Do not use your primary Polymarket account wallet or any wallet holding funds beyond your trading budget for this session. Create a dedicated wallet, fund it with your intended session budget, and transfer any remaining balance out after each session.
+</Warning>
+
+## Start with conservative sizing
+
+Before committing to larger amounts, run your first session with materially smaller caps than you ultimately intend to use.
+
+Recommended conservative starting values:
+
+| Variable | Conservative starting value |
+| -------- | --------------------------- |
+| `MAX_SPEND_PER_MARKET` | `10` (USDC) |
+| `LADDER_SIZE_PER_LEVEL_USDC` | `1` (USDC) |
+| `MAX_TAKER_FILL_USDC` | `10` (USDC) |
+| `MAX_LOSS_PER_HOUR_USDC` | `15` (USDC) |
+| `COPY_FIXED_USDC` | `2` (USDC, for copy mode) |
+| `COPY_MAX_USDC_PER_TRADE` | `5` (USDC, for copy mode) |
+
+Once you have reviewed a full session in `bot.log` and are satisfied with how the bot behaved, you can scale up incrementally.
+
+## Copy trading: always start with dry-run mode
+
+The dedicated copy trader in `src/copy/` can place orders within milliseconds of detecting a target wallet trade. Before running it with real funds, validate the signal pipeline and filter configuration using dry-run mode.
+
+```bash
+COPY_DRY_RUN=true node src/copy/index.js
+```
+
+In dry-run mode, the bot logs every trade it would copy — including computed size, max price, and latency — without submitting any orders. Run at least one full session in this mode and review `bot.log` to confirm:
+
+- The correct target wallets are being detected in `COPY_TARGETS`.
+- Skip reasons (`reason` field in debug log) are what you expect.
+- Spend caps are sized to your tolerance.
+- Latency numbers (`latencyMs`) are acceptable.
+
+Only set `COPY_DRY_RUN=false` after this review.
+
+## RPC reliability
+
+Public Polygon RPC endpoints are not suitable for production use. The bot performs on-chain transactions (approvals, merges, redeems) that require reliable, low-latency RPC connectivity. A failed or slow RPC response during an approval or merge can result in partial on-chain state.
+
+Use a private RPC endpoint from a provider such as Alchemy, Infura, or QuickNode. Set the endpoint in your `.env`:
+
+```bash
+POLYGON_RPC=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
+```
+
+The default fallback (`https://polygon-rpc.com`) is suitable only for testing with minimal funds.
+
+## MATIC gas balance
+
+Keep sufficient MATIC in your signer wallet for gas at all times. The bot submits several types of on-chain transactions during a session:
+
+- ERC-20 approval transactions at startup (once per session, amortized)
+- Merge transactions after accumulating matched complementary-token pairs
+- Redeem transactions after market resolution
+
+Polygon gas is inexpensive, but a zero MATIC balance will cause every transaction to fail with an out-of-gas or insufficient-funds error. Maintain a buffer of at least 1–2 MATIC in your signer wallet.
+
+## Proxy wallet verification
+
+Before the first run, double-check that `PROXY_WALLET` is the exact proxy wallet address associated with your Polymarket account. You can verify this in the Polymarket UI under your account settings.
+
+An incorrect `PROXY_WALLET` value will cause order submissions to fail at the CLOB level because orders are signed against the wrong account. It will not cause on-chain fund loss directly, but it will prevent any trades from executing.
+
+## Read the `.env.example` comments
+
+The `.env.example` file in the project root contains an explanation for every configuration variable. Many variables have non-obvious interactions — for example, `COMBINED_ASK_STOP` acts as a hard ceiling that overrides `TARGET_EDGE`, and `COPY_STALE_MS` silently drops signals older than the threshold.
+
+Read the comments in `.env.example` before editing your `.env`. Do not rely solely on the variable names.
+
+## Graceful shutdown
+
+The bot registers handlers for `SIGINT` (Ctrl+C) and `SIGTERM`. When either signal is received, it:
+
+1. Stops the outer market loop immediately.
+2. Signals any running `CopyTrader` to stop.
+3. Waits up to 5 seconds for in-flight tasks to complete.
+4. Prints a final session PnL summary.
+5. Exits cleanly.
+
+Avoid force-killing the process with `SIGKILL` or closing the terminal abruptly during an active trade. Doing so mid-merge or mid-redeem can leave partial on-chain state that requires manual intervention to resolve. Use Ctrl+C and wait for the shutdown log to confirm the process has exited.
+
+## Recommended first-run checklist
+
+<Steps>
+  <Step title="Prepare a dedicated wallet">
+    Create a new Polygon wallet for bot use only. Fund it with your intended session budget in USDC and at least 1 MATIC for gas. Do not use this wallet for any other purpose.
+  </Step>
+  <Step title="Configure a private RPC endpoint">
+    Sign up for a free tier account with Alchemy, Infura, or QuickNode and set `POLYGON_RPC` in your `.env`. Do not rely on the default public endpoint for a funded run.
+  </Step>
+  <Step title="Read .env.example and set conservative limits">
+    Open `.env.example`, read every comment, then set conservative values in `.env`. Use the starting values in the table above. Confirm `PRIVATE_KEY` and `PROXY_WALLET` match your dedicated wallet.
+  </Step>
+  <Step title="Run in dry-run mode (copy trading only)">
+    If using copy mode, set `COPY_DRY_RUN=true` and run `node src/copy/index.js` for one session. Review `bot.log` and confirm signals, filters, and sizing behave as expected before removing dry-run mode.
+  </Step>
+  <Step title="Run a live session with minimal funds">
+    Start the bot with your conservative caps. Monitor the console output in real time and let it complete at least one full market cycle. Use Ctrl+C for a clean shutdown.
+  </Step>
+  <Step title="Review bot.log before scaling">
+    After the session, examine `bot.log` using `jq` or a text editor. Check for any `error` or `warn` entries. Review market-complete PnL entries. Only increase sizing after you are comfortable with the bot's behavior at the current level.
+  </Step>
+</Steps>
+
+## Disclaimer
+
+This repository is provided for research and operational use by experienced users. It is **not financial advice** and does not guarantee profit or any specific outcome.
+
+Real-money trading on Polymarket and Polygon involves multiple categories of risk:
+
+- **Market risk** — prediction market prices are volatile and positions can expire worthless.
+- **Execution risk** — orders may not fill at the expected price, legs may fill partially, and network latency affects copy trade quality.
+- **Smart contract risk** — the Polymarket CTF and CTF Exchange contracts have been audited, but all smart contracts carry residual risk.
+- **RPC risk** — network instability or RPC provider outages can cause missed transactions, failed approvals, or incomplete on-chain state.
+- **Operational risk** — misconfiguration, key management errors, or process interruptions can result in fund loss.
+
+You are fully responsible for how you configure and operate this software. Review all configuration before running with real funds, start with an amount you can afford to lose entirely, and never run the bot unattended until you are confident in its behavior.

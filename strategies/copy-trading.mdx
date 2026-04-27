@@ -1,0 +1,153 @@
+---
+title: "Copy trading: mirror target wallet buys"
+description: "How to configure and run the Polymarket Copy Trading Bot's copy engine to mirror a target wallet's buys with FIXED, MIRROR, or RATIO sizing."
+---
+
+The copy trading system monitors one or more Polymarket proxy wallet addresses and mirrors their buy activity in your own wallet. When a target wallet buys a position, the bot detects it within a configurable polling interval, applies a filter and sizing pipeline, and fires an IOC (Immediate-Or-Cancel) buy order on your behalf — all without any manual intervention. Two integration paths are available depending on whether you want copy trading alongside the arbitrage engine or as a standalone operation.
+
+## Two copy-trading paths
+
+### Path 1: integrated copy watcher (`src/copy-trader.js`)
+
+When `TARGET_WALLET` is set in your `.env`, the main bot process automatically instantiates a `CopyTrader` from `src/copy-trader.js` and runs it alongside the arbitrage engine in the same Node.js process.
+
+This watcher tracks cumulative `totalBought` per position from the Data API. On each poll it computes the delta — how much more the target has spent on each asset since the last snapshot — and mirrors that increment. The startup snapshot records all existing positions so only **future** buys are copied, not the target's entire pre-existing portfolio.
+
+### Path 2: dedicated copy engine (`src/copy/`)
+
+The `src/copy/` directory contains a standalone copy-only bot with more sophisticated filtering and per-target multi-wallet support. Its entry point is `src/copy/index.js`.
+
+This path introduces two additional components:
+
+- **`ActivityFeed`** (`src/copy/activityFeed.js`) — polls `GET /trades?user=<addr>` on the Data API at `COPY_POLL_MS` interval for each target wallet and emits `trade` events for new buys.
+- **`CopyTrader`** (`src/copy/copyTrader.js`) — receives `trade` events and applies a multi-stage filter and sizing pipeline before placing orders.
+
+## How the dedicated copy engine works
+
+### ActivityFeed: polling for target trades
+
+The `ActivityFeed` class polls the Polymarket Data API rather than subscribing to a WebSocket. The comments in `src/copy/activityFeed.js` explain why:
+
+> Polymarket's user WebSocket is scoped to your own API credentials, so we can't receive another wallet's fill events there. The market WS publishes public `trade` events but omits the maker wallet, so filtering by target wallet isn't possible. The lowest-latency public source of a specific wallet's fills is `GET /trades?user=<addr>`.
+
+The feed uses keep-alive HTTP connections to minimize per-request handshake overhead, runs one in-flight request per target at a time (skipping a tick if the previous request hasn't returned), and deduplicates events by `transactionHash + asset`.
+
+**Startup warmup:** on the very first poll for each target, `ActivityFeed` marks all returned trades as seen without emitting them. This prevents the bot from copying the target's entire recent history when it first starts.
+
+### CopyTrader: filter and execute
+
+The `CopyTrader` class (`src/copy/copyTrader.js`) receives `trade` events and runs them through a synchronous filter before placing any order:
+
+```javascript src/copy/copyTrader.js
+_rejectReason(ev) {
+  if (ev.side !== 'BUY')                          return 'not-a-buy';
+  if (ev.ageMs > COPY_STALE_MS)                   return `stale(${ev.ageMs}ms)`;
+  if (ev.price < COPY_MIN_PRICE)                  return `price-too-low(${ev.price})`;
+  if (ev.price > COPY_MAX_PRICE)                  return `price-too-high(${ev.price})`;
+
+  const cid = (ev.conditionId || '').toLowerCase();
+  if (COPY_BLOCKED_CONDITIONS.has(cid))           return 'blocked-condition';
+  if (COPY_ALLOWED_CONDITIONS.size > 0 && !COPY_ALLOWED_CONDITIONS.has(cid)) {
+    return 'not-in-allow-list';
+  }
+
+  if (this.totalSpent >= COPY_MAX_USDC_TOTAL)     return 'total-cap';
+  if ((this.spentByMarket.get(cid) ?? 0) >= COPY_MAX_USDC_PER_MARKET) {
+    return 'per-market-cap';
+  }
+  if (this._rollingHourSpent() >= COPY_MAX_USDC_PER_HOUR) return 'hourly-cap';
+
+  return null;
+}
+```
+
+Every rejection reason is logged at `debug` level so you can audit exactly why a signal was not acted on.
+
+## Sizing modes
+
+Set `COPY_SIZE_MODE` in your `.env` to control how much the bot spends on each copied trade.
+
+<Tabs>
+  <Tab title="FIXED">
+    Always spend exactly `COPY_FIXED_USDC` USDC per copied trade, regardless of how much the target spent.
+
+    ```env
+    COPY_SIZE_MODE=FIXED
+    COPY_FIXED_USDC=10
+    ```
+
+    Best for: consistent, predictable spend per signal. The target's trade size has no effect on your order size.
+  </Tab>
+  <Tab title="MIRROR">
+    Spend exactly what the target spent (i.e., `target.price × target.size`), subject to all configured caps.
+
+    ```env
+    COPY_SIZE_MODE=MIRROR
+    COPY_MAX_USDC_PER_TRADE=50
+    ```
+
+    Best for: proportionally matching the target's conviction. Large target trades will spend more; small trades will spend less.
+  </Tab>
+  <Tab title="RATIO">
+    Spend `COPY_RATIO × target_usdc` per signal. A ratio of `0.1` means you spend 10% of what the target spent.
+
+    ```env
+    COPY_SIZE_MODE=RATIO
+    COPY_RATIO=0.1
+    ```
+
+    Best for: following a high-volume trader at a fraction of their scale, or managing position concentration across many copied markets.
+  </Tab>
+</Tabs>
+
+Regardless of the mode, the computed size is always capped by `COPY_MAX_USDC_PER_TRADE`, the remaining per-market budget, the remaining hourly budget, and the remaining total budget. The effective spend is the minimum of all of these.
+
+## Filter pipeline
+
+Every `trade` event passes through these checks in order before an order is placed:
+
+1. **Side check** — only `side=BUY` events are processed; sells are always ignored.
+2. **Staleness check** — if `ageMs > COPY_STALE_MS` (default: 8000ms), the signal is too old and is dropped. Stale signals indicate you are lagging behind the target and chasing a position that has already moved.
+3. **Price band** — `COPY_MIN_PRICE` (default: 0.02) and `COPY_MAX_PRICE` (default: 0.97) reject dust-level illiquid tails and near-certain outcomes where there is little upside.
+4. **Allow/block lists** — `COPY_ALLOWED_CONDITIONS` (whitelist) and `COPY_BLOCKED_CONDITIONS` (blacklist) filter by condition ID. If the allow list is non-empty, only listed conditions pass.
+5. **Spend caps** — checked in order: total cap → per-market cap → rolling hourly cap. The first cap that is exhausted stops the trade.
+
+After the filters pass, the max price is computed as `min(COPY_MAX_PRICE, target.price + COPY_MAX_SLIPPAGE)` to limit how far above the target's fill price you are willing to pay.
+
+## How to run
+
+**Via npm scripts (recommended):**
+
+```bash
+npm run copy
+```
+
+This sets `TRADING_MODE=copy` and runs `src/index.js`, which routes to the integrated `CopyTrader` from `src/copy-trader.js`.
+
+**Via the dedicated standalone entrypoint:**
+
+```bash
+node src/copy/index.js
+```
+
+This runs the fully-featured dedicated copy engine from `src/copy/` directly, with support for multiple `COPY_TARGETS` and the complete filter pipeline from `src/copy/copyTrader.js`.
+
+**With live reload during development:**
+
+```bash
+npm run copy:dev
+```
+
+## Dry run mode
+
+Set `COPY_DRY_RUN=true` to run the entire copy pipeline — polling, dedup, filtering, and sizing — without placing real orders. All decisions are logged at `info` level so you can verify which trades would have been copied and why others were rejected.
+
+```env
+COPY_DRY_RUN=true
+```
+
+When dry run is active, the bot also skips the on-chain USDC approval step at startup (no gas required). This is the recommended way to validate your `COPY_TARGETS`, sizing mode, and filter configuration before committing real capital.
+
+<Warning>
+  Dry run mode does not simulate slippage or order book depth. A trade that passes all filters in dry run may still fail to fill at your `maxPrice` in live mode if the market has moved.
+</Warning>

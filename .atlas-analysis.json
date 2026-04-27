@@ -1,0 +1,95 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Polymarket Copy Trading Bot",
+  "projectDescription": "A production-ready Node.js trading bot for Polymarket that supports both a dual-sided BTC Up/Down arbitrage strategy and a configurable copy-trading engine for mirroring target wallet activity on Polygon.",
+  "theme": "luma",
+  "primaryColor": "#1554f2",
+  "lightColor": "#82a4e1",
+  "darkColor": "#040404",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "requirements"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/overview",
+              "configuration/arbitrage-settings",
+              "configuration/copy-trading-settings"
+            ]
+          },
+          {
+            "group": "Strategies",
+            "pages": [
+              "strategies/arbitrage-bot",
+              "strategies/copy-trading",
+              "strategies/risk-controls"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/logging",
+              "operations/troubleshooting",
+              "operations/safety"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "reference/project-structure",
+              "reference/trader",
+              "reference/copy-engine"
+            ]
+          },
+          {
+            "group": "On-Chain",
+            "pages": [
+              "reference/onchain",
+              "reference/clob-client"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Dual-sided ladder execution on recurring BTC 5-minute Up/Down markets",
+    "Taker arbitrage logic triggered when combined best ask drops below configured edge threshold",
+    "On-chain merge and redeem support for Polymarket negative-risk markets",
+    "Session and per-market risk controls including spend caps and circuit breakers",
+    "Automatic CLOB credential derivation via Polymarket's L1-to-L2 auth flow",
+    "Live WebSocket order-book tracking with REST fallback",
+    "Dedicated buy-only copy-trading engine with staleness, price, and spend filters",
+    "Structured Winston logging to console and file",
+    "Graceful shutdown on SIGINT/SIGTERM"
+  ],
+  "publicApiSurface": [
+    "npm start — launch main arbitrage bot (TRADING_MODE=arb)",
+    "npm run copy — launch dedicated copy trader (TRADING_MODE=copy)",
+    "npm run arb — explicit arbitrage mode via cross-env",
+    "npm run dev — arbitrage bot with Node file watcher",
+    "node src/copy/index.js — dedicated copy-trading entrypoint",
+    "Trader class (src/trader.js) — per-market state machine",
+    "CopyTrader class (src/copy/copyTrader.js) — copy execution engine",
+    "ActivityFeed class (src/copy/activityFeed.js) — target wallet trade poller",
+    "ClobClient (src/clob.js) — CLOB REST + WebSocket client",
+    "ensureApprovals() (src/onchain.js) — one-time Polygon approvals",
+    "mergePositions() (src/onchain.js) — burn matched YES+NO pairs for USDC",
+    "redeemPositions() (src/onchain.js) — claim winning token payout after resolution"
+  ]
+}
